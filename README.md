@@ -224,3 +224,7 @@ uv run benchmarks/longbench_benchmark.py
 - **No LLM-generated slop** — AI-assisted code is fine, but bulk-generated boilerplate with no thought behind it will be rejected.
 - **Minor features welcome** — small, well-scoped PRs that add useful functionality will be considered.
 - **Large feature requests** — open an issue first to discuss the design before writing any code.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).

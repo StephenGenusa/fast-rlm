@@ -2,6 +2,7 @@
   "name": "tui_log_viewer",
   "module": "src/index.tsx",
   "type": "module",
+  "license": "MIT",
   "private": true,
   "scripts": {
     "dev": "bun run --watch src/index.tsx",
