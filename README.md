@@ -25,7 +25,7 @@ If you find this helpful, consider supporting on Patreon — it hosts all code, 
 
 ## Demo
 
-<video src="/Users/avishekbiswas/Projects/neuralavb-site/public/media/projects/RLM-demo.mp4" controls width="100%"></video>
+<video src="https://github.com/user-attachments/assets/fcaeab69-e384-4b26-8d6a-b71c1464e7f2" controls width="100%"></video>
 
 ---
 
