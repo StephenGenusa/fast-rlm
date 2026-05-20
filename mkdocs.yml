@@ -49,6 +49,7 @@ nav:
       - Quick Start: getting-started/quickstart.md
   - Guide:
       - Configuration: guide/configuration.md
+      - Advanced Customization: guide/advanced.md
       - Log Viewer: guide/log-viewer.md
       - Best Practices & Troubleshooting: guide/tips.md
   - Development:
