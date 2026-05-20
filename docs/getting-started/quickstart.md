@@ -48,6 +48,68 @@ print(result["results"])
 
 The agent will write code to search, filter, and chunk the transcripts on its own — no manual splitting required.
 
+## Structured input & output
+
+You can pass a `dict` as the query and ask for a typed result back via `output_schema`. The agent receives the dict as a real Python `dict` (no string parsing on its first turn), and its `FINAL` value is validated against the schema before being returned.
+
+```python
+import fast_rlm
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    movie: str
+    average_score: float
+    consensus: str
+
+result = fast_rlm.run(
+    {
+        "task": "Aggregate the reviews into a single verdict.",
+        "movie": "The Trail of Pixels",
+        "reviews": [
+            {"name": "Asha", "score": 8, "text": "Tight pacing..."},
+            {"name": "Bo",   "score": 6, "text": "Beautiful but thin..."},
+            {"name": "Cy",   "score": 9, "text": "Instant favorite..."},
+        ],
+    },
+    output_schema=Verdict,
+)
+
+verdict = Verdict.model_validate(result["results"])
+```
+
+### Structured input
+
+When `query` is a `dict`, the agent's initial probe prints a flat top-level schema (keys + type + length + truncated preview per key) instead of dumping the whole context as a string. The agent can index `context["reviews"]` on its first real turn — no `json.loads`, no slicing.
+
+### Structured output
+
+`output_schema` accepts:
+
+| Form | Example |
+|---|---|
+| Pydantic model class | `output_schema=MyModel` |
+| Pydantic generic | `output_schema=list[MyModel]` |
+| Python primitive | `output_schema=int` (also `str`, `float`, `bool`, `list`, `dict`) |
+| Raw JSON Schema dict | `output_schema={"type": "array", "items": {"type": "string"}}` |
+
+The schema is shown to the agent at step 0 under `Required output schema for FINAL (JSON Schema):`. After every `FINAL(...)` call the value is validated. On failure the agent receives the schema and the specific validation errors (path + message) and may retry within its remaining call budget. Pydantic is an *optional* dependency — only required if you pass a Pydantic class or a generic like `list[MyModel]`.
+
+!!! note "JSON-Schema-isms to remember"
+    - `{"type": "integer"}` accepts whole-valued floats like `42.0` (standard JSON-Schema behavior; JSON has no int/float distinction).
+    - `{"type": "number"}` accepts integers.
+    - `{"type": "boolean"}` rejects `1`/`0` — booleans are not integers in JSON.
+
+### Schemas for subagents
+
+Inside the REPL the agent can require a subagent's output shape by passing a JSON Schema dict as the second argument to `llm_query`:
+
+```python
+schema = {"type": "array", "items": {"type": "string"}}
+fruits = await llm_query("Generate 25 fruit names.", schema)
+```
+
+The child subagent enforces the schema the same way. This removes parsing on the parent's side and forces the child to produce the exact shape requested.
+
 ## With configuration
 
 ```python
@@ -70,10 +132,11 @@ result = run(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `query` | `str` | _(required)_ | The question or context to process |
+| `query` | `str` or `dict` | _(required)_ | The question / context to process. A `dict` triggers the [structured input](#structured-input) probe. |
 | `prefix` | `str` | `None` | Log filename prefix (e.g. `"r_count"` → `r_count_2026-02-23T...`) |
 | `config` | `RLMConfig` or `dict` | `None` | Config overrides (see [Configuration](../guide/configuration.md)) |
 | `verbose` | `bool` | `True` | Stream engine output to terminal |
+| `output_schema` | Pydantic class / type / JSON Schema dict | `None` | If set, the agent's `FINAL` value is [validated](#structured-output) before being returned. |
 
 ## Quiet mode
 

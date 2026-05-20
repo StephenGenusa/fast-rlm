@@ -85,6 +85,57 @@ print(result["results"])
 
 The agent will write code to search, filter, and chunk the transcripts on its own — no manual splitting required.
 
+## Structured Input & Output
+
+Instead of squeezing your data into a string, you can pass a `dict` as the query and ask for a typed result back via `output_schema`. The agent receives the dict as a real Python `dict` (no parsing on its first turn), and its `FINAL` value is validated against the schema before being returned.
+
+```python
+import fast_rlm
+from pydantic import BaseModel
+
+class Verdict(BaseModel):
+    movie: str
+    average_score: float
+    consensus: str
+
+result = fast_rlm.run(
+    {
+        "task": "Aggregate the reviews into a single verdict.",
+        "movie": "The Trail of Pixels",
+        "reviews": [
+            {"name": "Asha", "score": 8, "text": "Tight pacing..."},
+            {"name": "Bo",   "score": 6, "text": "Beautiful but thin..."},
+            {"name": "Cy",   "score": 9, "text": "Instant favorite..."},
+        ],
+    },
+    output_schema=Verdict,
+)
+
+verdict = Verdict.model_validate(result["results"])
+```
+
+**Structured input.** When `query` is a `dict`, the agent's initial probe prints a flat top-level schema (keys + type + length + truncated preview) so it can index `context["reviews"]` directly instead of stringifying.
+
+**Structured output.** `output_schema` accepts:
+
+| Form | Example |
+|---|---|
+| Pydantic model class | `output_schema=MyModel` |
+| Pydantic generic | `output_schema=list[MyModel]` |
+| Python primitive | `output_schema=int` (also `str`, `float`, `bool`, `list`, `dict`) |
+| Raw JSON Schema dict | `output_schema={"type": "array", "items": {"type": "string"}}` |
+
+The schema is shown to the agent at step 0 (`Required output schema for FINAL (JSON Schema):`). After every `FINAL(...)` call the value is validated; on failure the agent receives the schema and the specific validation errors (path + message) and may retry within its remaining call budget. Pydantic is an *optional* dependency — only required if you pass a Pydantic class or generic.
+
+**Schemas for subagents.** Inside the REPL the agent can require a subagent's output shape by passing a JSON Schema dict as the second argument to `llm_query`:
+
+```repl
+schema = {"type": "array", "items": {"type": "string"}}
+fruits = await llm_query("Generate 25 fruit names.", schema)
+```
+
+The child subagent enforces the schema the same way. See [`examples/structured_io.py`](examples/structured_io.py) and [`examples/parallel_r_count.py`](examples/parallel_r_count.py) for end-to-end demos.
+
 ## Configuration
 
 ```python

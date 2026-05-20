@@ -5,9 +5,45 @@ import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
+
+
+_PRIMITIVE_JSON_SCHEMAS = {
+    str: {"type": "string"},
+    int: {"type": "integer"},
+    float: {"type": "number"},
+    bool: {"type": "boolean"},
+    list: {"type": "array"},
+    dict: {"type": "object"},
+}
+
+
+def _to_json_schema(schema: Any) -> dict:
+    """Convert a user-supplied output schema into a JSON Schema dict.
+
+    Accepts:
+      - dict: assumed to already be a JSON Schema, returned as-is.
+      - Python primitive type (str/int/float/bool/list/dict): mapped directly.
+      - Pydantic BaseModel subclass: uses model_json_schema().
+      - Any other type usable by pydantic.TypeAdapter (e.g. list[int]): uses TypeAdapter.
+    """
+    if isinstance(schema, dict):
+        return schema
+    if isinstance(schema, type) and schema in _PRIMITIVE_JSON_SCHEMAS:
+        return _PRIMITIVE_JSON_SCHEMAS[schema]
+    try:
+        from pydantic import BaseModel, TypeAdapter
+    except ImportError as e:
+        raise TypeError(
+            "output_schema must be a JSON Schema dict, a primitive type "
+            "(str/int/float/bool/list/dict), or a pydantic type. "
+            "Install pydantic to use Pydantic models or generic types."
+        ) from e
+    if isinstance(schema, type) and issubclass(schema, BaseModel):
+        return schema.model_json_schema()
+    return TypeAdapter(schema).json_schema()
 
 
 @dataclass
@@ -84,6 +120,7 @@ def run(
     prefix: Optional[str] = None,
     config: Optional[RLMConfig | dict] = None,
     verbose: bool = True,
+    output_schema: Optional[Any] = None,
 ) -> dict:
     """Run a fast-rlm query.
 
@@ -94,6 +131,12 @@ def run(
         prefix: Optional log filename prefix.
         config: RLMConfig object or dict of overrides (e.g. primary_agent, max_depth).
         verbose: If True, stream deno stdout/stderr to terminal.
+        output_schema: Optional schema the root agent's FINAL value must satisfy.
+            Accepts a Pydantic model class, a primitive Python type (str/int/
+            float/bool/list/dict), a `pydantic.TypeAdapter`-compatible type, or
+            a raw JSON Schema dict. Validation runs after FINAL is set; on
+            failure the agent receives the schema + errors and may retry within
+            its remaining call budget.
 
     Returns:
         Dict with 'results', 'usage', and optionally 'log_file'.
@@ -127,6 +170,14 @@ def run(
             f"query must be a str or dict, got {type(query).__name__}"
         )
     stdin_payload = json.dumps(query)
+
+    schema_tmpfile = None
+    if output_schema is not None:
+        schema_dict = _to_json_schema(output_schema)
+        schema_tmpfile = tempfile.mktemp(suffix=".schema.json")
+        with open(schema_tmpfile, "w") as f:
+            json.dump(schema_dict, f)
+        cmd += ["--output-schema-file", schema_tmpfile]
 
     # RLMConfig merge: load defaults, overlay user overrides, write to temp file
     config_tmpfile = None
@@ -171,6 +222,8 @@ def run(
             os.unlink(output_file)
         if config_tmpfile and os.path.exists(config_tmpfile):
             os.unlink(config_tmpfile)
+        if schema_tmpfile and os.path.exists(schema_tmpfile):
+            os.unlink(schema_tmpfile)
 
     if "error" in data:
         raise RuntimeError(f"fast-rlm subagent failed: {data['error']}")

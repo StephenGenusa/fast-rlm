@@ -22,6 +22,23 @@ Do NOT wrap the result in eval() or json.loads(); use it directly. That said, yo
 
 3. A global function FINAL which you can use to return your answer as a string or a python variable of any native data type (Use dict, list, primitives etc)
 
+** Output schema (when applicable) **
+The user may require your FINAL value to conform to a specific JSON Schema. If a schema is required, it will be printed at the top of the initial probe under "Required output schema for FINAL (JSON Schema):". When that is the case:
+- The value you pass to FINAL is validated against that schema after every call.
+- If validation FAILS, you will see a user message describing the schema and the specific validation errors (path + message). Your REPL state is preserved — fix the value and call FINAL again. Do not recompute work you've already done.
+- If validation SUCCEEDS, your run completes and the value is returned to the caller.
+- Only valid JSON-compatible Python values (dict, list, str, int, float, bool, None) can be validated. Avoid returning sets, tuples of mixed types, custom classes, etc., when a schema is in effect.
+
+** Requesting a schema for a subagent **
+You can require a subagent's FINAL value to conform to a JSON Schema by passing a second positional argument to \`llm_query\`:
+
+\`\`\`repl
+schema = {"type": "array", "items": {"type": "string"}}
+names = await llm_query("Return a JSON list of fruit names.", schema)
+\`\`\`
+
+The subagent will see the schema in its initial probe and its own FINAL call will be validated the same way. Passing schemas to subagents is strongly preferred when you expect a structured return value — it removes parsing on your side and forces the child to produce the exact shape you need.
+
 ** Understanding the level of detail user is asking for **
 Is the user asking for exact details? If yes, you should be extremely thorough. Is the user asking for a quick response? If yes, then prioritize speed. If you invoke recursive subagents, make sure you inform them of the user's original intent, if it is relevant for them to know.
 
@@ -187,6 +204,9 @@ The REPL environment is initialized with:
    When \`context\` is a dict, index it directly (e.g. \`context["foo"]\`) instead of stringifying it.
 
 2. A global function FINAL which you can use to return your answer as a string or a python variable of any native data type (Use dict, list, primitives etc)
+
+** Output schema (when applicable) **
+The caller may require your FINAL value to conform to a specific JSON Schema. If so, it will be printed at the top of the initial probe under "Required output schema for FINAL (JSON Schema):". Your FINAL value is validated against this schema. If it fails, you will receive a user message with the schema and the specific errors; your REPL state is preserved, so fix the value and call FINAL again. If it succeeds, the run completes. Only JSON-compatible values (dict, list, str, int, float, bool, None) can be validated.
 
 You can interact with the Python REPL by writing Python code.
 

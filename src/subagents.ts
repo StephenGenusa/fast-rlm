@@ -1,10 +1,52 @@
 import { loadPyodide } from "pyodide";
 import { parse as parseYaml } from "@std/yaml";
+// ajv ships as CJS; Deno's npm interop wraps the default export in a namespace
+// whose `.default` property is the actual constructor.
+// deno-lint-ignore no-explicit-any
+import * as AjvNs from "ajv";
+// deno-lint-ignore no-explicit-any
+const Ajv: any = (AjvNs as any).default ?? AjvNs;
+interface AjvError {
+    instancePath?: string;
+    message?: string;
+    params?: Record<string, unknown>;
+}
+interface ValidateFunction {
+    (data: unknown): boolean;
+    errors?: AjvError[] | null;
+}
 import { generate_code, Usage } from "./call_llm.ts";
 import { Logger, setLogDir, setLogPrefix, getLogFile } from "./logging.ts";
 import { startSpinner, showGlobalUsage } from "./ui.ts";
 import { trackUsage, getTotalUsage, resetUsage } from "./usage.ts";
 import chalk from "npm:chalk@5";
+
+const _ajv = new Ajv({ strict: false, allErrors: true });
+
+function compileSchema(schema: unknown): ValidateFunction | null {
+    if (schema == null) return null;
+    try {
+        return _ajv.compile(schema as object);
+    } catch (e) {
+        throw new Error(
+            `Invalid output schema: ${e instanceof Error ? e.message : String(e)}`
+        );
+    }
+}
+
+function formatValidationErrors(validate: ValidateFunction): string {
+    if (!validate.errors) return "(no error details)";
+    return validate.errors
+        .map((e) => {
+            const path = e.instancePath || "(root)";
+            return `  - ${path}: ${e.message}${
+                e.params && Object.keys(e.params).length
+                    ? ` [${JSON.stringify(e.params)}]`
+                    : ""
+            }`;
+        })
+        .join("\n");
+}
 
 interface RlmConfig {
     max_calls_per_subagent?: number;
@@ -65,12 +107,15 @@ function now(): string {
 }
 
 type Context = string | Record<string, unknown> | unknown[];
+type JsonSchema = Record<string, unknown>;
 
 export async function subagent(
     context: Context,
     subagent_depth = 0,
-    parent_run_id?: string
+    parent_run_id?: string,
+    outputSchema?: JsonSchema | null,
 ) {
+    const validate = compileSchema(outputSchema ?? null);
     const logger = new Logger(subagent_depth, MAX_CALLS, parent_run_id);
     logger.logAgentStart();
 
@@ -86,28 +131,39 @@ export async function subagent(
     });
     console.log("✔ Python Ready");
 
-    const llm_query = async (context: unknown) => {
+    const pyProxyToJs = (val: unknown): unknown => {
+        if (val && typeof (val as { toJs?: unknown }).toJs === "function") {
+            return (val as { toJs: (opts: unknown) => unknown }).toJs({
+                dict_converter: Object.fromEntries,
+            });
+        }
+        return val;
+    };
+
+    const llm_query = async (context: unknown, child_schema?: unknown) => {
         if (subagent_depth >= MAX_DEPTH) {
             stdoutBuffer += "\nError: MAXIMUM DEPTH REACHED. You must solve this task on your own without calling llm_query.\n";
             throw new Error("MAXIMUM DEPTH REACHED. You must solve this task on your own without calling llm_query.");
         }
-        // If Python passes a dict/list it arrives as a PyProxy; convert to a
-        // plain JS value before recursing so the child agent gets native types.
-        let plain: Context;
-        if (context && typeof (context as { toJs?: unknown }).toJs === "function") {
-            plain = (context as { toJs: (opts: unknown) => Context }).toJs({
-                dict_converter: Object.fromEntries,
-            });
-        } else {
-            plain = context as Context;
-        }
+        // Dict/list contexts arrive as PyProxy from Python; same for schema.
+        const plain = pyProxyToJs(context) as Context;
         if (typeof plain !== "string" && (typeof plain !== "object" || plain === null)) {
             throw new Error(
                 `llm_query expects a string or dict/list context, got ${typeof plain}`
             );
         }
+        let childSchema: JsonSchema | null = null;
+        if (child_schema != null) {
+            const s = pyProxyToJs(child_schema);
+            if (typeof s !== "object" || s === null || Array.isArray(s)) {
+                throw new Error(
+                    `llm_query output_schema must be a JSON Schema dict, got ${typeof s}`
+                );
+            }
+            childSchema = s as JsonSchema;
+        }
         console.log("↳ llm_query called");
-        const output = await subagent(plain, subagent_depth + 1, logger.run_id);
+        const output = await subagent(plain, subagent_depth + 1, logger.run_id, childSchema);
         return output;
     };
     pyodide.globals.set("llm_query", llm_query);
@@ -130,8 +186,14 @@ def FINAL(x):
 `;
     await pyodide.runPythonAsync(setup_code);
 
+    const schemaPreambleCode = outputSchema
+        ? `print("Required output schema for FINAL (JSON Schema):")
+print(${JSON.stringify(JSON.stringify(outputSchema, null, 2))})
+print("---")
+`
+        : "";
     const initial_code = `
-if isinstance(context, dict):
+${schemaPreambleCode}if isinstance(context, dict):
     print(f"Context type: dict")
     print(f"Keys ({len(context)}): {list(context.keys())}")
     print("---")
@@ -255,11 +317,42 @@ Output:\n${stdoutBuffer.trim()}
 
         const finalResultSet = pyodide.globals.get("__final_result_set__");
         if (finalResultSet) {
-            logger.logStep({ step: i + 1, code, reasoning: message.reasoning, usage, timestamps: stepTimestamps });
             let result = pyodide.globals.get("__final_result__");
-            if (result && typeof result.toJs === 'function') {
-                result = result.toJs();
+            if (result && typeof result.toJs === "function") {
+                result = result.toJs({ dict_converter: Object.fromEntries });
             }
+
+            if (validate && !validate(result)) {
+                const errText = formatValidationErrors(validate);
+                const schemaStr = JSON.stringify(outputSchema, null, 2);
+                const feedback =
+                    `FINAL value failed schema validation. The value you passed to FINAL does NOT match the required output schema.\n\n` +
+                    `Required JSON Schema:\n${schemaStr}\n\n` +
+                    `Validation errors:\n${errText}\n\n` +
+                    `Fix the value and call FINAL again. The agent state is preserved; you do not need to recompute everything.`;
+                // Reset Python flags so the loop continues.
+                await pyodide.runPythonAsync(
+                    "__final_result__ = None\n__final_result_set__ = False\n"
+                );
+                stdoutBuffer += `\n${feedback}\n`;
+                const truncatedErr = truncateText(stdoutBuffer);
+                logger.logStep({
+                    step: i + 1,
+                    code,
+                    output: truncatedErr,
+                    hasError: true,
+                    reasoning: message.reasoning,
+                    usage,
+                    timestamps: stepTimestamps,
+                });
+                messages.push({
+                    "role": "user",
+                    "content": `Output: \n${truncatedErr}`,
+                });
+                continue;
+            }
+
+            logger.logStep({ step: i + 1, code, reasoning: message.reasoning, usage, timestamps: stepTimestamps });
             logger.logFinalResult(result);
             logger.logAgentEnd();
             return result;
@@ -323,7 +416,15 @@ if (import.meta.main) {
         } else {
             query_context = raw_stdin;
         }
-        out = await subagent(query_context);
+
+        const schemaIdx = Deno.args.indexOf("--output-schema-file");
+        let rootSchema: JsonSchema | null = null;
+        if (schemaIdx !== -1 && Deno.args[schemaIdx + 1]) {
+            const schemaRaw = await Deno.readTextFile(Deno.args[schemaIdx + 1]);
+            rootSchema = JSON.parse(schemaRaw) as JsonSchema;
+        }
+
+        out = await subagent(query_context, 0, undefined, rootSchema);
 
         // Final result is already logged inside subagent()
         // Show global usage across all runs
