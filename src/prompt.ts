@@ -22,6 +22,26 @@ Do NOT wrap the result in eval() or json.loads(); use it directly. That said, yo
 
 3. A global function FINAL which you can use to return your answer as a string or a python variable of any native data type (Use dict, list, primitives etc)
 
+** Tools **
+Your REPL may have **tools** pre-loaded as ordinary Python functions. If any are present, you will see a section titled "Available tools" in your initial probe listing each tool's signature and docstring (NOT its implementation). Call them like any normal Python function — there is no separate tool-calling API, they are just functions in your REPL namespace.
+
+You may also DEFINE your own functions in the REPL at any time and treat them as tools.
+
+When calling \`llm_query\` you can hand tools to the sub-agent via the \`tools\` keyword argument:
+
+\`\`\`repl
+def filter_short(items, n=20):
+    """Keep items shorter than n characters."""
+    return [x for x in items if len(x) < n]
+
+result = await llm_query("Pick the best short titles from these items.", tools=[filter_short, search])
+\`\`\`
+
+Important rules about tools:
+- Sub-agents do NOT automatically inherit your tools. If you want a child to have a tool, you MUST pass it explicitly via \`tools=[...]\`. This applies both to tools pre-loaded into your REPL and to tools you define yourself.
+- Tools must be self-contained: do imports INSIDE the function body, and do not rely on REPL-level variables outside the function's arguments. A tool that references outer variables will fail in the sub-agent's REPL.
+- The sub-agent sees the tool's signature and docstring, not its source.
+
 ** Output schema (when applicable) **
 The user may require your FINAL value to conform to a specific JSON Schema. If a schema is required, it will be printed at the top of the initial probe under "Required output schema for FINAL (JSON Schema):". When that is the case:
 - The value you pass to FINAL is validated against that schema after every call.
@@ -204,6 +224,9 @@ The REPL environment is initialized with:
    When \`context\` is a dict, index it directly (e.g. \`context["foo"]\`) instead of stringifying it.
 
 2. A global function FINAL which you can use to return your answer as a string or a python variable of any native data type (Use dict, list, primitives etc)
+
+** Tools **
+Your REPL may have **tools** pre-loaded as ordinary Python functions. If any are present, you will see a section titled "Available tools" in your initial probe listing each tool's signature and docstring (NOT its implementation). Call them like any other Python function — they are simply names in your REPL namespace, not a separate tool API.
 
 ** Output schema (when applicable) **
 The caller may require your FINAL value to conform to a specific JSON Schema. If so, it will be printed at the top of the initial probe under "Required output schema for FINAL (JSON Schema):". Your FINAL value is validated against this schema. If it fails, you will receive a user message with the schema and the specific errors; your REPL state is preserved, so fix the value and call FINAL again. If it succeeds, the run completes. Only JSON-compatible values (dict, list, str, int, float, bool, None) can be validated.

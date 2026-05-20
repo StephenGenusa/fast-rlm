@@ -114,6 +114,8 @@ export async function subagent(
     subagent_depth = 0,
     parent_run_id?: string,
     outputSchema?: JsonSchema | null,
+    toolSources?: string[] | null,
+    envVars?: Record<string, string> | null,
 ) {
     const validate = compileSchema(outputSchema ?? null);
     const logger = new Logger(subagent_depth, MAX_CALLS, parent_run_id);
@@ -140,12 +142,16 @@ export async function subagent(
         return val;
     };
 
-    const llm_query = async (context: unknown, child_schema?: unknown) => {
+    const js_llm_query = async (
+        context: unknown,
+        child_schema?: unknown,
+        child_tool_sources?: unknown,
+    ) => {
         if (subagent_depth >= MAX_DEPTH) {
             stdoutBuffer += "\nError: MAXIMUM DEPTH REACHED. You must solve this task on your own without calling llm_query.\n";
             throw new Error("MAXIMUM DEPTH REACHED. You must solve this task on your own without calling llm_query.");
         }
-        // Dict/list contexts arrive as PyProxy from Python; same for schema.
+        // Dict/list contexts arrive as PyProxy from Python; same for schema and tools.
         const plain = pyProxyToJs(context) as Context;
         if (typeof plain !== "string" && (typeof plain !== "object" || plain === null)) {
             throw new Error(
@@ -162,11 +168,28 @@ export async function subagent(
             }
             childSchema = s as JsonSchema;
         }
+        let childTools: string[] | null = null;
+        if (child_tool_sources != null) {
+            const t = pyProxyToJs(child_tool_sources);
+            if (!Array.isArray(t) || !t.every((x) => typeof x === "string")) {
+                throw new Error(
+                    `llm_query tools must be a list of Python functions (received non-string sources)`
+                );
+            }
+            childTools = t as string[];
+        }
         console.log("↳ llm_query called");
-        const output = await subagent(plain, subagent_depth + 1, logger.run_id, childSchema);
+        const output = await subagent(
+            plain,
+            subagent_depth + 1,
+            logger.run_id,
+            childSchema,
+            childTools,
+            envVars ?? null,
+        );
         return output;
     };
-    pyodide.globals.set("llm_query", llm_query);
+    pyodide.globals.set("__js_llm_query__", js_llm_query);
 
     // Initialize context. Strings are embedded as Python string literals;
     // dicts/lists are passed through json.loads so the agent gets a real
@@ -174,8 +197,13 @@ export async function subagent(
     const contextLiteral = typeof context === "string"
         ? JSON.stringify(context)
         : `__import__('json').loads(${JSON.stringify(JSON.stringify(context))})`;
+    const envInjection = envVars && Object.keys(envVars).length
+        ? `import os, json as _json
+os.environ.update(_json.loads(${JSON.stringify(JSON.stringify(envVars))}))
+`
+        : "";
     const setup_code = `
-context = ${contextLiteral}
+${envInjection}context = ${contextLiteral}
 __final_result__ = None
 __final_result_set__ = False
 
@@ -183,8 +211,44 @@ def FINAL(x):
     global __final_result__, __final_result_set__
     __final_result__ = x
     __final_result_set__ = True
+
+__tools__ = []
+
+def __register_tool__(src):
+    _ns = {}
+    exec(src, globals(), _ns)
+    _fn = next((v for v in _ns.values() if callable(v)), None)
+    if _fn is None:
+        raise ValueError("Tool source defined no callable: " + src[:200])
+    globals()[_fn.__name__] = _fn
+    __tools__.append(_fn)
+
+async def llm_query(context, schema=None, *, tools=None):
+    """Recursively query a sub-agent.
+
+    Args:
+        context: str or dict — the task/context for the sub-agent.
+        schema: optional JSON Schema (as a dict) the sub-agent's FINAL must satisfy.
+        tools: optional list of Python functions to expose in the sub-agent's REPL.
+            By default the sub-agent does NOT inherit your tools; pass them
+            explicitly here if you want the child to have access.
+    """
+    _tool_sources = None
+    if tools:
+        import inspect as _inspect
+        _tool_sources = [_inspect.getsource(_t) for _t in tools]
+    return await __js_llm_query__(context, schema, _tool_sources)
 `;
     await pyodide.runPythonAsync(setup_code);
+
+    // Register tools (if any) into the REPL globals + __tools__ list.
+    if (toolSources && toolSources.length) {
+        for (const src of toolSources) {
+            await pyodide.runPythonAsync(
+                `__register_tool__(${JSON.stringify(src)})`
+            );
+        }
+    }
 
     const schemaPreambleCode = outputSchema
         ? `print("Required output schema for FINAL (JSON Schema):")
@@ -216,6 +280,25 @@ else:
         print(f"Last 500 characters of str(context): ", str(context)[-500:])
     else:
         print(f"Context: ", context)
+
+import inspect as _inspect
+if __tools__:
+    print("---")
+    print(f"Available tools ({len(__tools__)}) — callable directly in this REPL:")
+    for _t in __tools__:
+        try:
+            _sig = str(_inspect.signature(_t))
+        except (TypeError, ValueError):
+            _sig = "(...)"
+        _doc = _inspect.getdoc(_t)
+        print(f"def {_t.__name__}{_sig}:")
+        if _doc:
+            for _line in _doc.splitlines():
+                print(f"    {_line}")
+        print()
+else:
+    print("---")
+    print("Available tools: (none provided)")
 `
     stdoutBuffer = "";
     const step0ExecStart = now();
@@ -424,7 +507,32 @@ if (import.meta.main) {
             rootSchema = JSON.parse(schemaRaw) as JsonSchema;
         }
 
-        out = await subagent(query_context, 0, undefined, rootSchema);
+        const toolsIdx = Deno.args.indexOf("--tools-file");
+        let rootTools: string[] | null = null;
+        if (toolsIdx !== -1 && Deno.args[toolsIdx + 1]) {
+            const toolsRaw = await Deno.readTextFile(Deno.args[toolsIdx + 1]);
+            const parsedTools = JSON.parse(toolsRaw);
+            if (!Array.isArray(parsedTools) || !parsedTools.every((x) => typeof x === "string")) {
+                throw new Error("--tools-file must decode to a list of source strings");
+            }
+            rootTools = parsedTools as string[];
+        }
+
+        const envIdx = Deno.args.indexOf("--env-file");
+        let rootEnv: Record<string, string> | null = null;
+        if (envIdx !== -1 && Deno.args[envIdx + 1]) {
+            const envRaw = await Deno.readTextFile(Deno.args[envIdx + 1]);
+            const parsedEnv = JSON.parse(envRaw);
+            if (
+                typeof parsedEnv !== "object" || parsedEnv === null || Array.isArray(parsedEnv) ||
+                !Object.entries(parsedEnv).every(([k, v]) => typeof k === "string" && typeof v === "string")
+            ) {
+                throw new Error("--env-file must decode to an object of string → string");
+            }
+            rootEnv = parsedEnv as Record<string, string>;
+        }
+
+        out = await subagent(query_context, 0, undefined, rootSchema, rootTools, rootEnv);
 
         // Final result is already logged inside subagent()
         // Show global usage across all runs

@@ -1,11 +1,13 @@
+import inspect
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+import textwrap
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import yaml
 
@@ -115,12 +117,30 @@ def _deno_prefix_cmd() -> list[str]:
     return [deno]
 
 
+def _extract_tool_source(tool: Callable) -> str:
+    if not callable(tool):
+        raise TypeError(
+            f"tools must be callables, got {type(tool).__name__}"
+        )
+    try:
+        src = inspect.getsource(tool)
+    except (OSError, TypeError) as e:
+        raise TypeError(
+            f"Could not extract source for tool {getattr(tool, '__name__', tool)!r}. "
+            f"Tools must be regular Python functions defined in a source file "
+            f"(not lambdas, builtins, or REPL-defined). ({e})"
+        ) from e
+    return textwrap.dedent(src)
+
+
 def run(
     query: "str | dict",
     prefix: Optional[str] = None,
     config: Optional[RLMConfig | dict] = None,
     verbose: bool = True,
     output_schema: Optional[Any] = None,
+    tools: Optional[list[Callable]] = None,
+    env_variables: Optional[dict[str, str]] = None,
 ) -> dict:
     """Run a fast-rlm query.
 
@@ -131,6 +151,18 @@ def run(
         prefix: Optional log filename prefix.
         config: RLMConfig object or dict of overrides (e.g. primary_agent, max_depth).
         verbose: If True, stream deno stdout/stderr to terminal.
+        env_variables: Optional dict of string KV pairs injected as
+            `os.environ` entries inside every Pyodide REPL spawned by this
+            run (root and all sub-agents). They are NOT set on the Deno host
+            process and never leak outside Pyodide. Useful for handing API
+            keys / configuration to tools without exposing them to the model.
+        tools: Optional list of Python callables exposed to the root agent.
+            Each function's source is extracted via `inspect.getsource` and
+            executed inside the agent's Pyodide REPL before initialization.
+            Tools must be self-contained — do internal imports, and do not
+            close over module-level variables. Sub-agents do NOT inherit
+            these tools; the parent agent must explicitly pass them via
+            `llm_query(query, tools=[...])` (or define new ones in its REPL).
         output_schema: Optional schema the root agent's FINAL value must satisfy.
             Accepts a Pydantic model class, a primitive Python type (str/int/
             float/bool/list/dict), a `pydantic.TypeAdapter`-compatible type, or
@@ -170,6 +202,25 @@ def run(
             f"query must be a str or dict, got {type(query).__name__}"
         )
     stdin_payload = json.dumps(query)
+
+    env_tmpfile = None
+    if env_variables:
+        if not isinstance(env_variables, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in env_variables.items()
+        ):
+            raise TypeError("env_variables must be a dict[str, str]")
+        env_tmpfile = tempfile.mktemp(suffix=".env.json")
+        with open(env_tmpfile, "w") as f:
+            json.dump(env_variables, f)
+        cmd += ["--env-file", env_tmpfile]
+
+    tools_tmpfile = None
+    if tools:
+        tool_sources = [_extract_tool_source(t) for t in tools]
+        tools_tmpfile = tempfile.mktemp(suffix=".tools.json")
+        with open(tools_tmpfile, "w") as f:
+            json.dump(tool_sources, f)
+        cmd += ["--tools-file", tools_tmpfile]
 
     schema_tmpfile = None
     if output_schema is not None:
@@ -224,6 +275,10 @@ def run(
             os.unlink(config_tmpfile)
         if schema_tmpfile and os.path.exists(schema_tmpfile):
             os.unlink(schema_tmpfile)
+        if tools_tmpfile and os.path.exists(tools_tmpfile):
+            os.unlink(tools_tmpfile)
+        if env_tmpfile and os.path.exists(env_tmpfile):
+            os.unlink(env_tmpfile)
 
     if "error" in data:
         raise RuntimeError(f"fast-rlm subagent failed: {data['error']}")
