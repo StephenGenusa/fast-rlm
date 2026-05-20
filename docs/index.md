@@ -36,6 +36,9 @@ The root agent orchestrates the task by writing Python code. When it needs help 
 
 - **Recursive decomposition** — agents spawn sub-agents to handle subtasks
 - **REPL-based reasoning** — agents write and execute Python code iteratively
+- **Custom Python tools** — register your own functions; the agent calls them like normal Python, and can even define new tools mid-run to hand to sub-agents ([guide](guide/advanced.md#tool-calling-process))
+- **Scoped environment variables** — inject credentials into the REPL via `env_variables=` without exposing them to the model ([guide](guide/advanced.md#environment-variables))
+- **Typed inputs & outputs** — pass a `dict` query and constrain `FINAL` with a Pydantic model or JSON Schema ([guide](getting-started/quickstart.md#structured-input-output))
 - **Budget controls** — set hard limits on depth, calls, and dollar spend
 - **Any OpenAI-compatible API** — works with OpenRouter, OpenAI, local models, etc.
 - **Structured logging** — every step logged as JSONL, viewable in an interactive TUI
