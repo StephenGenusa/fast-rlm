@@ -3,7 +3,16 @@ max_depth: 3
 truncate_len: 2000
 primary_agent: "z-ai/glm-5"
 sub_agent: "minimax/minimax-m2.5"
-max_money_spent: 1.0
+max_money_spent: 0.2
 # API retry / timeout
 api_max_retries: 3
 api_timeout_ms: 30000
+# Ablation toggles (default true). Set false to remove the capability from the
+# agent's REPL and strip it from the system prompt (applies to root + sub-agents).
+enable_tools: true
+enable_structured_io: true
+# Compression guard: force a self-confirm before delegating a large,
+# barely-compressed context to a subagent (ablatable).
+enable_compression_guard: true
+compression_min_chars: 5000
+compression_ratio: 0.6

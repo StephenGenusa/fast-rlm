@@ -15,7 +15,7 @@ interface ValidateFunction {
     (data: unknown): boolean;
     errors?: AjvError[] | null;
 }
-import { generate_code, Usage } from "./call_llm.ts";
+import { confirmDelegation, generate_code, Usage } from "./call_llm.ts";
 // MCP is optional: only the *types* are imported statically (erased at compile,
 // so they pull in nothing at runtime). The implementation in ./mcp.ts — and its
 // heavy `@modelcontextprotocol/sdk` npm dependency — is loaded lazily via dynamic
@@ -65,6 +65,13 @@ interface RlmConfig {
     max_prompt_tokens?: number;
     api_max_retries?: number;
     api_timeout_ms?: number;
+    // Ablation toggles (default true). When false, the capability is removed at
+    // the agent/subagent layer AND stripped from the system prompt.
+    enable_tools?: boolean;
+    enable_structured_io?: boolean;
+    enable_compression_guard?: boolean;
+    compression_min_chars?: number;
+    compression_ratio?: number;
 }
 
 function loadConfig(): RlmConfig {
@@ -91,6 +98,11 @@ const MAX_COMPLETION_TOKENS = _config.max_completion_tokens ?? 50000;
 const MAX_PROMPT_TOKENS = _config.max_prompt_tokens ?? 200000;
 const API_MAX_RETRIES = _config.api_max_retries ?? 3;
 const API_TIMEOUT_MS = _config.api_timeout_ms ?? 600000;
+const ENABLE_TOOLS = _config.enable_tools ?? true;
+const ENABLE_STRUCTURED_IO = _config.enable_structured_io ?? true;
+const ENABLE_COMPRESSION_GUARD = _config.enable_compression_guard ?? true;
+const COMPRESSION_MIN_CHARS = _config.compression_min_chars ?? 5000;
+const COMPRESSION_RATIO = _config.compression_ratio ?? 0.6;
 
 function truncateText(text: string): string {
     let truncatedOutput = "";
@@ -139,8 +151,21 @@ export async function subagent(
     // Which MCP servers this agent may see: null = all (root), [] = none
     // (default for sub-agents), [names] = the subset the parent granted.
     mcpAllowedServers?: string[] | null,
+    // Extra LLM params (temperature, top_p, seed, ...) passed to every API call,
+    // inherited by all sub-agents. From run(llm_kwargs=...).
+    llmKwargs?: Record<string, unknown> | null,
+    // Set by the parent when its delegation tripped the compression heuristic;
+    // this agent must self-confirm (YES/NO) before running its loop.
+    confirmInfo?: { childChars: number; parentChars: number } | null,
 ) {
-    const validate = compileSchema(outputSchema ?? null);
+    // Structured I/O ablation: when disabled, ignore any requested output schema
+    // (no validation, no schema preamble) and present dict/list contexts as plain
+    // strings instead of running the structured flat-schema probe.
+    const effectiveSchema = ENABLE_STRUCTURED_IO ? (outputSchema ?? null) : null;
+    const effectiveContext: Context = (!ENABLE_STRUCTURED_IO && typeof context !== "string")
+        ? JSON.stringify(context)
+        : context;
+    const validate = compileSchema(effectiveSchema);
     const logger = new Logger(subagent_depth, MAX_CALLS, parent_run_id);
     logger.logAgentStart();
 
@@ -184,6 +209,9 @@ await micropip.install(["requests", "httpx"])
         child_schema?: unknown,
         child_tool_sources?: unknown,
         child_mcp_servers?: unknown,
+        // Set by batch_llm_query: the batch was already judged once, so skip the
+        // per-call compression guard for these children.
+        suppress_guard?: unknown,
     ) => {
         if (subagent_depth >= MAX_DEPTH) {
             stdoutBuffer += "\nError: MAXIMUM DEPTH REACHED. You must solve this task on your own without calling llm_query.\n";
@@ -197,7 +225,7 @@ await micropip.install(["requests", "httpx"])
             );
         }
         let childSchema: JsonSchema | null = null;
-        if (child_schema != null) {
+        if (child_schema != null && ENABLE_STRUCTURED_IO) {
             const s = pyProxyToJs(child_schema);
             if (typeof s !== "object" || s === null || Array.isArray(s)) {
                 throw new Error(
@@ -207,7 +235,7 @@ await micropip.install(["requests", "httpx"])
             childSchema = s as JsonSchema;
         }
         let childTools: string[] | null = null;
-        if (child_tool_sources != null) {
+        if (child_tool_sources != null && ENABLE_TOOLS) {
             const t = pyProxyToJs(child_tool_sources);
             if (!Array.isArray(t) || !t.every((x) => typeof x === "string")) {
                 throw new Error(
@@ -229,6 +257,21 @@ await micropip.install(["requests", "httpx"])
             childMcpServers = m as string[];
         }
         console.log("↳ llm_query called");
+
+        // Compression guard: if this delegation ships a large, barely-compressed
+        // context, flag the child to self-confirm before it runs.
+        let confirmInfo: { childChars: number; parentChars: number } | null = null;
+        if (ENABLE_COMPRESSION_GUARD && !suppress_guard) {
+            const sizeOf = (v: unknown) =>
+                typeof v === "string" ? v.length : JSON.stringify(v).length;
+            const parentChars = sizeOf(context);
+            const childChars = sizeOf(plain);
+            if (parentChars >= COMPRESSION_MIN_CHARS &&
+                childChars >= COMPRESSION_RATIO * parentChars) {
+                confirmInfo = { childChars, parentChars };
+            }
+        }
+
         const output = await subagent(
             plain,
             subagent_depth + 1,
@@ -238,10 +281,56 @@ await micropip.install(["requests", "httpx"])
             envVars ?? null,
             mcp ?? null,
             childMcpServers,
+            llmKwargs ?? null,
+            confirmInfo,
         );
         return output;
     };
     pyodide.globals.set("__js_llm_query__", js_llm_query);
+
+    // ---- Batch compression guard -------------------------------------------
+    // batch_llm_query (a drop-in for asyncio.gather over llm_query calls) routes
+    // here ONCE for the whole fan-out. Python passes {parentChars, items:[{childChars,
+    // preview}]}; we apply the same heuristic and, if it trips, make a SINGLE judge
+    // call covering the whole batch and return one approve/reject.
+    const js_batch_confirm = async (metaJson: unknown): Promise<boolean> => {
+        if (!ENABLE_COMPRESSION_GUARD) return true;
+        let meta: { parentChars: number; items: { childChars: number; preview: string }[] };
+        try {
+            meta = JSON.parse(String(metaJson));
+        } catch {
+            return true; // can't parse → don't block
+        }
+        const { parentChars, items } = meta;
+        if (!items?.length || parentChars < COMPRESSION_MIN_CHARS) return true;
+        const tripping = items.filter((it) => it.childChars >= COMPRESSION_RATIO * parentChars);
+        if (tripping.length === 0) return true; // legit small-chunk map → no judge
+
+        const lines = items.map((it, i) =>
+            `  [${i + 1}] ${it.childChars.toLocaleString()} chars (` +
+            `${Math.round((it.childChars / Math.max(1, parentChars)) * 100)}% of your context): ` +
+            `${(it.preview || "").slice(0, 140)}`).join("\n");
+        const q =
+            `STOP — confirmation required before this PARALLEL batch of ${items.length} ` +
+            `subagent calls runs.\nYour context is ${parentChars.toLocaleString()} chars. ` +
+            `The children would receive:\n${lines}\n${tripping.length} of them get a large, ` +
+            `barely-compressed slice of your context. RLM works best when you slice/filter/` +
+            `summarize in your OWN repl first and delegate only the reduced result.\n` +
+            `Approve the WHOLE batch? Reply YES or NO on the first line, then a one-line reason.`;
+        const verdict = await confirmDelegation(
+            messages, q, model_name, is_leaf_agent,
+            { maxRetries: API_MAX_RETRIES, timeout: API_TIMEOUT_MS },
+            {
+                enableTools: ENABLE_TOOLS,
+                enableStructuredIo: ENABLE_STRUCTURED_IO,
+                enableCompressionGuard: ENABLE_COMPRESSION_GUARD,
+            },
+            llmKwargs ?? null,
+        );
+        trackUsage(verdict.usage);
+        return verdict.approve;
+    };
+    pyodide.globals.set("__js_batch_confirm__", js_batch_confirm);
 
     // ---- MCP bridge --------------------------------------------------------
     // Which servers this agent may see: null → all (root), else the granted set.
@@ -276,9 +365,9 @@ await micropip.install(["requests", "httpx"])
     // Initialize context. Strings are embedded as Python string literals;
     // dicts/lists are passed through json.loads so the agent gets a real
     // Python dict/list (not a JsProxy).
-    const contextLiteral = typeof context === "string"
-        ? JSON.stringify(context)
-        : `__import__('json').loads(${JSON.stringify(JSON.stringify(context))})`;
+    const contextLiteral = typeof effectiveContext === "string"
+        ? JSON.stringify(effectiveContext)
+        : `__import__('json').loads(${JSON.stringify(JSON.stringify(effectiveContext))})`;
     const envInjection = envVars && Object.keys(envVars).length
         ? `import os, json as _json
 os.environ.update(_json.loads(${JSON.stringify(JSON.stringify(envVars))}))
@@ -355,8 +444,44 @@ def __register_tool__(src):
     globals()[_fn.__name__] = _fn
     __tools__.append(_fn)
 
-async def llm_query(context, schema=None, *, tools=None, mcp=None):
-    """Recursively query a sub-agent.
+class _LazyQuery:
+    """Awaitable handle for a sub-agent query.
+
+    Awaiting it runs the call normally (with the per-call compression guard).
+    batch_llm_query reads its .context up front (one batch judge) and runs it
+    with the guard suppressed.
+    """
+    __slots__ = ("context", "schema", "tools", "mcp")
+
+    def __init__(self, context, schema, tools, mcp):
+        self.context = context
+        self.schema = schema
+        self.tools = tools
+        self.mcp = mcp
+
+    def __await__(self):
+        return self._run(False).__await__()
+
+    async def _run(self, suppress):
+        _tool_sources = None
+        if self.tools:
+            import inspect as _inspect
+            _tool_sources = []
+            for _t in self.tools:
+                _stashed = getattr(_t, "__fast_rlm_source__", None)
+                if _stashed is not None:
+                    _tool_sources.append(_stashed)
+                else:
+                    _tool_sources.append(_inspect.getsource(_t))
+        _mcp = list(self.mcp) if self.mcp else None
+        _result = await __js_llm_query__(self.context, self.schema, _tool_sources, _mcp, suppress)
+        if hasattr(_result, "to_py"):
+            return _result.to_py()
+        return _result
+
+
+def llm_query(context, schema=None, *, tools=None, mcp=None):
+    """Recursively query a sub-agent. Use 'await llm_query(...)'.
 
     Args:
         context: str or dict — the task/context for the sub-agent.
@@ -368,26 +493,63 @@ async def llm_query(context, schema=None, *, tools=None, mcp=None):
             By default the sub-agent inherits NO MCP servers; name the ones it
             may use (e.g. mcp=["fsio"]) and it gets that server's tools/resources.
     """
-    _tool_sources = None
-    if tools:
-        import inspect as _inspect
-        _tool_sources = []
-        for _t in tools:
-            _stashed = getattr(_t, "__fast_rlm_source__", None)
-            if _stashed is not None:
-                _tool_sources.append(_stashed)
-            else:
-                _tool_sources.append(_inspect.getsource(_t))
-    _mcp = list(mcp) if mcp else None
-    _result = await __js_llm_query__(context, schema, _tool_sources, _mcp)
-    if hasattr(_result, "to_py"):
-        return _result.to_py()
-    return _result
-`;
+    return _LazyQuery(context, schema, tools, mcp)
+
+
+async def batch_llm_query(*queries):
+    """Run several sub-agent queries in PARALLEL — a drop-in for
+    asyncio.gather(*[llm_query(...), llm_query(...), ...]).
+
+    Unlike asyncio.gather, the whole batch is checked for compression ONCE (a
+    single reviewer call decides whether to approve the entire fan-out), instead
+    of each call being checked separately. Prefer this over asyncio.gather when
+    you delegate to many sub-agents at once. Returns results in order.
+
+        results = await batch_llm_query(llm_query(c1), llm_query(c2), llm_query(c3))
+    """
+    import asyncio as _asyncio
+    import json as _json
+    qs = list(queries)
+    if len(qs) == 1 and isinstance(qs[0], (list, tuple)):
+        qs = list(qs[0])
+    if not all(isinstance(q, _LazyQuery) for q in qs):
+        raise TypeError("batch_llm_query expects llm_query(...) calls, e.g. "
+                        "batch_llm_query(llm_query(a), llm_query(b))")
+
+    def _meta(ctx):
+        s = ctx if isinstance(ctx, str) else _json.dumps(ctx)
+        return {"childChars": len(s), "preview": s[:160]}
+
+    _parent = context if isinstance(context, str) else _json.dumps(context)
+    _payload = {"parentChars": len(_parent), "items": [_meta(q.context) for q in qs]}
+    _approved = await __js_batch_confirm__(_json.dumps(_payload))
+    if not _approved:
+        raise RuntimeError(
+            "BATCH_DELEGATION_REJECTED: this parallel batch was declined as "
+            "under-compressed. Slice/filter/summarize each context in your OWN "
+            "REPL first, then delegate only the reduced results."
+        )
+    return await _asyncio.gather(*[q._run(True) for q in qs])
+${ENABLE_COMPRESSION_GUARD ? `
+# Failsafe: block llm_query() handles passed into asyncio.gather, steering the
+# model to batch_llm_query (which does one compression check for the whole batch).
+# batch_llm_query is unaffected: it passes coroutines (q._run), not _LazyQuery.
+import asyncio as _aio_guard
+_real_gather = _aio_guard.gather
+def _guarded_gather(*aws, **kw):
+    if any(isinstance(a, _LazyQuery) for a in aws):
+        raise RuntimeError(
+            "Do not call llm_query inside asyncio.gather. Use batch_llm_query(...) "
+            "instead - it runs them in parallel with a SINGLE compression check. "
+            "Example: await batch_llm_query(llm_query(a), llm_query(b))")
+    return _real_gather(*aws, **kw)
+_aio_guard.gather = _guarded_gather
+` : ""}`;
     await pyodide.runPythonAsync(setup_code);
 
     // Register tools (if any) into the REPL globals + __tools__ list.
-    if (toolSources && toolSources.length) {
+    // Skipped entirely when the tools capability is disabled (ablation).
+    if (ENABLE_TOOLS && toolSources && toolSources.length) {
         for (const src of toolSources) {
             await pyodide.runPythonAsync(
                 `__register_tool__(${JSON.stringify(src)})`
@@ -484,10 +646,40 @@ if mcp_list_resource_templates():
         print(f"    [{_t['server']}] {_t['uriTemplate']}  -  {_t.get('description','')}")
 `
         : "";
-    const schemaPreambleCode = outputSchema
+    const schemaPreambleCode = effectiveSchema
         ? `print("Required output schema for FINAL (JSON Schema):")
-print(${JSON.stringify(JSON.stringify(outputSchema, null, 2))})
+print(${JSON.stringify(JSON.stringify(effectiveSchema, null, 2))})
 print("---")
+`
+        : "";
+    // Tools probe is omitted entirely when the tools capability is disabled.
+    const toolsProbeCode = ENABLE_TOOLS
+        ? `
+import inspect as _inspect
+if __tools__:
+    print("---")
+    print(f"Available tools ({len(__tools__)}) — callable directly in this REPL.")
+    print("NOTE: tools marked [async] must be called with 'await' (e.g. inside")
+    print("      an 'async def' or via asyncio.run). Tools marked [sync] are")
+    print("      called directly with no await.")
+    print()
+    for _t in __tools__:
+        try:
+            _sig = str(_inspect.signature(_t))
+        except (TypeError, ValueError):
+            _sig = "(...)"
+        _doc = _inspect.getdoc(_t)
+        _is_async = _inspect.iscoroutinefunction(_t)
+        _kw = "async def" if _is_async else "def"
+        _kind = "[async — needs await]" if _is_async else "[sync]"
+        print(f"{_kw} {_t.__name__}{_sig}:  {_kind}")
+        if _doc:
+            for _line in _doc.splitlines():
+                print(f"    {_line}")
+        print()
+else:
+    print("---")
+    print("Available tools: (none provided)")
 `
         : "";
     const initial_code = `
@@ -514,33 +706,7 @@ else:
         print(f"Last 500 characters of str(context): ", str(context)[-500:])
     else:
         print(f"Context: ", context)
-
-import inspect as _inspect
-if __tools__:
-    print("---")
-    print(f"Available tools ({len(__tools__)}) — callable directly in this REPL.")
-    print("NOTE: tools marked [async] must be called with 'await' (e.g. inside")
-    print("      an 'async def' or via asyncio.run). Tools marked [sync] are")
-    print("      called directly with no await.")
-    print()
-    for _t in __tools__:
-        try:
-            _sig = str(_inspect.signature(_t))
-        except (TypeError, ValueError):
-            _sig = "(...)"
-        _doc = _inspect.getdoc(_t)
-        _is_async = _inspect.iscoroutinefunction(_t)
-        _kw = "async def" if _is_async else "def"
-        _kind = "[async — needs await]" if _is_async else "[sync]"
-        print(f"{_kw} {_t.__name__}{_sig}:  {_kind}")
-        if _doc:
-            for _line in _doc.splitlines():
-                print(f"    {_line}")
-        print()
-else:
-    print("---")
-    print("Available tools: (none provided)")
-${mcpProbeCode}`
+${toolsProbeCode}${mcpProbeCode}`
     stdoutBuffer = "";
     const step0ExecStart = now();
     await pyodide.runPythonAsync(initial_code);
@@ -577,13 +743,57 @@ Output:\n${stdoutBuffer.trim()}
         }
     });
 
+    const promptOpts = {
+        enableTools: ENABLE_TOOLS,
+        enableStructuredIo: ENABLE_STRUCTURED_IO,
+        enableCompressionGuard: ENABLE_COMPRESSION_GUARD,
+    };
+    const apiOpts = { maxRetries: API_MAX_RETRIES, timeout: API_TIMEOUT_MS };
+
+    // Compression guard: the parent flagged this delegation as barely-compressed.
+    // Self-confirm (same model, same system prompt, same probe → cache reuse)
+    // before doing any work; a NO blocks and forces the caller to compress.
+    if (confirmInfo && ENABLE_COMPRESSION_GUARD) {
+        const { childChars, parentChars } = confirmInfo;
+        const pct = Math.round((childChars / Math.max(1, parentChars)) * 100);
+        const confirmQuestion =
+            `STOP — confirmation required before this delegation runs.\n` +
+            `You were handed a context of ${childChars.toLocaleString()} characters via the ` +
+            `parent's llm_query call — that is ${pct}% of the delegating agent's own context ` +
+            `(${parentChars.toLocaleString()} chars), which suggests it was passed with little ` +
+            `or no compression. RLM works best when the caller slices/filters/summarizes in its ` +
+            `OWN REPL first and delegates only the reduced result.\n` +
+            `Reply on the FIRST line with exactly YES (this delegation is appropriate — e.g. a ` +
+            `genuine map step over one chunk) or NO (the caller should compress first).\n` +
+            `If NO: give a one-line reason, THEN a concrete \`\`\`repl code block the caller can ` +
+            `run in its own REPL to compress the context (keyword/regex slicing, chunking, or ` +
+            `summarizing into a smaller variable) before delegating the reduced result. The probe ` +
+            `above shows the context shape and the task — make the code specific to them. Do NOT ` +
+            `tell them to simply call llm_query again with the full context.`;
+        const confirmSpinner = startSpinner("Confirming delegation...");
+        const verdict = await confirmDelegation(
+            messages, confirmQuestion, model_name, is_leaf_agent, apiOpts, promptOpts, llmKwargs ?? null,
+        );
+        trackUsage(verdict.usage);
+        if (!verdict.approve) {
+            confirmSpinner.success("Delegation rejected");
+            logger.logAgentEnd();
+            throw new Error(
+                `DELEGATION_REJECTED: this call was declined as under-compressed ` +
+                `(${pct}% of your context). Do the compression in YOUR OWN REPL — slice/filter/` +
+                `summarize the context into a smaller variable — then delegate only that reduced ` +
+                `result. Do NOT re-send the full context. Suggested REPL code from the reviewer:\n` +
+                `${verdict.reason}`
+            );
+        }
+        confirmSpinner.success("Delegation approved");
+    }
+
     for (let i = 0; i < MAX_CALLS; i++) {
         const llmCallStart = now();
         const llmSpinner = startSpinner("Generating code...");
-        const { code, success, message, usage } = await generate_code(messages, model_name, is_leaf_agent, {
-            maxRetries: API_MAX_RETRIES,
-            timeout: API_TIMEOUT_MS,
-        });
+        const { code, success, message, usage } = await generate_code(
+            messages, model_name, is_leaf_agent, apiOpts, promptOpts, llmKwargs ?? null);
         const llmCallEnd = now();
         messages.push(message);
 
@@ -648,7 +858,7 @@ Output:\n${stdoutBuffer.trim()}
 
             if (validate && !validate(result)) {
                 const errText = formatValidationErrors(validate);
-                const schemaStr = JSON.stringify(outputSchema, null, 2);
+                const schemaStr = JSON.stringify(effectiveSchema, null, 2);
                 const feedback =
                     `FINAL value failed schema validation. The value you passed to FINAL does NOT match the required output schema.\n\n` +
                     `Required JSON Schema:\n${schemaStr}\n\n` +
@@ -790,8 +1000,19 @@ if (import.meta.main) {
             );
         }
 
+        const llmKwargsIdx = Deno.args.indexOf("--llm-kwargs-file");
+        let rootLlmKwargs: Record<string, unknown> | null = null;
+        if (llmKwargsIdx !== -1 && Deno.args[llmKwargsIdx + 1]) {
+            const raw = await Deno.readTextFile(Deno.args[llmKwargsIdx + 1]);
+            const parsed = JSON.parse(raw);
+            if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+                throw new Error("--llm-kwargs-file must decode to a JSON object");
+            }
+            rootLlmKwargs = parsed as Record<string, unknown>;
+        }
+
         // Root agent: mcpAllowedServers = null → sees all configured servers.
-        out = await subagent(query_context, 0, undefined, rootSchema, rootTools, rootEnv, mcpHandle, null);
+        out = await subagent(query_context, 0, undefined, rootSchema, rootTools, rootEnv, mcpHandle, null, rootLlmKwargs);
 
         // Final result is already logged inside subagent()
         // Show global usage across all runs

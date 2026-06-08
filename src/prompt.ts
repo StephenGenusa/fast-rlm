@@ -107,6 +107,17 @@ This Python REPL environment is your primary method to access the context. Read 
 
 You can write comments, but it is not needed, since a user won't read them. So skip writing comments or write very short ones.
 
+** Delegation & compression **
+When you hand context to a subagent via \`llm_query\`, COMPRESS it first — slice, filter, or summarize so the child receives only what it needs. Do NOT forward your whole context one level deeper; that wastes tokens and defeats the point of recursion. If you try to delegate a large context with little compression, the environment will ask you to confirm the call — prefer to chunk or summarize instead, and only proceed if passing the (near-)full data is genuinely necessary (e.g. an identical map step applied to each chunk).
+
+For PARALLEL delegation, use \`await batch_llm_query(llm_query(c1), llm_query(c2), ...)\` INSTEAD of \`asyncio.gather\`. It runs the calls in parallel exactly like gather and returns results in order, but performs ONE compression review for the whole batch instead of interrupting each call separately:
+
+\`\`\`repl
+# Map a question over chunks, in parallel, with a single compression check:
+chunks = [context[i:i+8000] for i in range(0, len(context), 8000)]
+results = await batch_llm_query(*[llm_query({"task": "Find any mention of X.", "context": c}) for c in chunks])
+\`\`\`
+
 ** How to control subagent behavior **
 - When calling an \`llm_query\` sometimes it is best for you as a parent agent to read actual context picked from the data. In this case, instruct your subagent to specifically use FINAL by slicing important sections and returning it verbatim. No need to autoregressively generate a summarized answer. 
 
@@ -135,7 +146,7 @@ When you want to execute Python code in the REPL environment, wrap it in triple 
 *** SLOWNESS ***
 - The biggest reason why programs are slow is if you run subagents one-after-the-other.
 - Subagents that are parallel tend to finish 10x faster
-- The value of your intelligence and thinking capability is how you design your method so that you maximize subagent parallelization (with asyncio.gather(*tasks))
+- The value of your intelligence and thinking capability is how you design your method so that you maximize subagent parallelization (with \`batch_llm_query(*tasks)\`, the parallel form of \`llm_query\`)
 
 ** Printing **
 
@@ -171,13 +182,11 @@ for i, section in enumerate(context):
         print(f"After section {i} of {len(context)}, you have tracked: {buffer}")
 \`\`\`
 
-As another example, when the context is quite long (e.g. >500K characters), a simple but viable strategy is, based on the context chunk lengths, to combine them and recursively query an LLM over chunks. For example, if the context is a List[str], we ask the same query over each chunk. You can also run these queries in parallel using \`asyncio.gather\`:
+As another example, when the context is quite long (e.g. >500K characters), a simple but viable strategy is, based on the context chunk lengths, to combine them and recursively query an LLM over chunks. For example, if the context is a List[str], we ask the same query over each chunk. Run these queries in parallel with \`batch_llm_query\`:
 
 \`\`\`repl
-import asyncio
-
 query = 'A man became famous for his book "The Great Gatsby". How many jobs did he have?'
-# Suppose our context is ~1M chars, and we want each sub-LLM query to be ~0.1M chars so we split it into 5 chunks
+# Suppose our context is ~1M chars, and we want each sub-LLM query to be ~0.1M chars so we split it into 10 chunks
 chunk_size = len(context) // 10
 tasks = []
 for i in range(10):
@@ -185,11 +194,11 @@ for i in range(10):
         chunk_str = "\\n".join(context[i * chunk_size: (i + 1) * chunk_size])
     else:
         chunk_str = "\\n".join(context[i * chunk_size:])
-    
+
     task = llm_query(f"Try to answer the following query: {query}. Here are the documents:\\n{chunk_str}. Only answer if you are confident in your answer based on the evidence.", schema=None, tools=[])
     tasks.append(task)
 
-answers = await asyncio.gather(*tasks)
+answers = await batch_llm_query(*tasks)   # parallel; one compression check for the whole batch
 for i, answer in enumerate(answers):
     print(f"I got the answer from chunk {i}: {answer}")
 
@@ -335,3 +344,65 @@ FINAL(...)
 Do not output multiple code blocks. All your code must be inside a single \`\`\`repl ... \`\`\` block.
 `
 
+
+
+// --------------------------------------------------------------------------- //
+// Capability gating (for ablation studies).
+//
+// The two big optional capabilities -- user-defined TOOLS and STRUCTURED I/O
+// (output schemas + subagent schemas) -- each live in a dedicated "** ... **"
+// section of the prompts above. We strip those sections out when the capability
+// is disabled, so the agent is never told about a feature it cannot use.
+// Section boundaries are the "** Header **" markers, so the prose is untouched.
+// --------------------------------------------------------------------------- //
+
+export interface PromptOptions {
+    enableTools?: boolean; // default true
+    enableStructuredIo?: boolean; // default true
+    enableCompressionGuard?: boolean; // default true (root prompt only)
+}
+
+// Remove text from startMarker (inclusive) up to endMarker (exclusive).
+function removeBetween(text: string, startMarker: string, endMarker: string): string {
+    const s = text.indexOf(startMarker);
+    if (s === -1) return text;
+    const e = text.indexOf(endMarker, s + startMarker.length);
+    if (e === -1) return text;
+    return text.slice(0, s) + text.slice(e);
+}
+
+export function buildSystemPrompt(isLeaf: boolean, opts: PromptOptions = {}): string {
+    const enableTools = opts.enableTools !== false;
+    const enableStructuredIo = opts.enableStructuredIo !== false;
+    const enableCompressionGuard = opts.enableCompressionGuard !== false;
+    let p = isLeaf ? LEAF_AGENT_SYSTEM_PROMPT : SYSTEM_PROMPT;
+
+    // Delegation/compression guidance lives only in the root (non-leaf) prompt,
+    // since leaf agents can't call llm_query. Strip it when the guard is off.
+    if (!enableCompressionGuard && !isLeaf) {
+        p = removeBetween(p, "** Delegation & compression **",
+            "** How to control subagent behavior **");
+    }
+
+    if (!enableTools) {
+        // Root: Tools section runs up to the MCP section. Leaf: up to Output schema.
+        p = removeBetween(
+            p,
+            "** Tools **",
+            isLeaf
+                ? "** Output schema (when applicable) **"
+                : "** MCP tools & resources (when applicable) **",
+        );
+    }
+    if (!enableStructuredIo) {
+        // Root: Output schema + Requesting schema + Input schema. Leaf: Output schema only.
+        p = removeBetween(
+            p,
+            "** Output schema (when applicable) **",
+            isLeaf
+                ? "You can interact with the Python REPL by writing Python code."
+                : "** Understanding the level of detail user is asking for **",
+        );
+    }
+    return p;
+}

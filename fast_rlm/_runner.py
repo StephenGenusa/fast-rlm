@@ -57,11 +57,24 @@ class RLMConfig:
     max_depth: int = 3
     max_calls_per_subagent: int = 20
     truncate_len: int = 2000
-    max_money_spent: float = 1.0
+    max_money_spent: float = 0.2
     max_completion_tokens: int = 50000
     max_prompt_tokens: int = 200000
     api_max_retries: int = 3
     api_timeout_ms: int = 600000
+    # Ablation toggles. When False, the capability is removed from the agent's
+    # REPL AND stripped from its system prompt (root + all sub-agents):
+    #   enable_tools           -> user-defined Python tools + llm_query(tools=...)
+    #   enable_structured_io   -> output_schema validation, llm_query(schema=...),
+    #                             and dict/list inputs (shown to the agent as str)
+    enable_tools: bool = True
+    enable_structured_io: bool = True
+    # Compression guard: when an agent delegates a large, barely-compressed
+    # context to a subagent, make it self-confirm (same model, same system
+    # prompt) before the call runs; NO blocks and forces a compress + retry.
+    enable_compression_guard: bool = True
+    compression_min_chars: int = 5000
+    compression_ratio: float = 0.6
 
     @classmethod
     def default(cls) -> "RLMConfig":
@@ -142,6 +155,7 @@ def run(
     tools: Optional[list[Callable]] = None,
     env_variables: Optional[dict[str, str]] = None,
     mcp_servers: Optional[dict[str, dict]] = None,
+    llm_kwargs: Optional[dict] = None,
 ) -> dict:
     """Run a fast-rlm query.
 
@@ -172,6 +186,10 @@ def run(
             close over module-level variables. Sub-agents do NOT inherit
             these tools; the parent agent must explicitly pass them via
             `llm_query(query, tools=[...])` (or define new ones in its REPL).
+        llm_kwargs: Optional dict of extra parameters spread into every LLM
+            chat-completion call (root + all sub-agents), e.g.
+            ``{"temperature": 0.1, "top_p": 0.9, "seed": 7}``. Passed through
+            untouched to the OpenAI-compatible ``chat.completions.create`` call.
         output_schema: Optional schema the root agent's FINAL value must satisfy.
             Accepts a Pydantic model class, a primitive Python type (str/int/
             float/bool/list/dict), a `pydantic.TypeAdapter`-compatible type, or
@@ -253,6 +271,17 @@ def run(
             json.dump(mcp_servers, f)
         cmd += ["--mcp-file", mcp_tmpfile]
 
+    llm_kwargs_tmpfile = None
+    if llm_kwargs is not None:
+        if not isinstance(llm_kwargs, dict) or not all(
+            isinstance(k, str) for k in llm_kwargs
+        ):
+            raise TypeError("llm_kwargs must be a dict with string keys")
+        llm_kwargs_tmpfile = tempfile.mktemp(suffix=".llm_kwargs.json")
+        with open(llm_kwargs_tmpfile, "w") as f:
+            json.dump(llm_kwargs, f)
+        cmd += ["--llm-kwargs-file", llm_kwargs_tmpfile]
+
     # RLMConfig merge: load defaults, overlay user overrides, write to temp file
     config_tmpfile = None
     if config is not None:
@@ -304,6 +333,8 @@ def run(
             os.unlink(env_tmpfile)
         if mcp_tmpfile and os.path.exists(mcp_tmpfile):
             os.unlink(mcp_tmpfile)
+        if llm_kwargs_tmpfile and os.path.exists(llm_kwargs_tmpfile):
+            os.unlink(llm_kwargs_tmpfile)
 
     if "error" in data:
         raise RuntimeError(f"fast-rlm subagent failed: {data['error']}")

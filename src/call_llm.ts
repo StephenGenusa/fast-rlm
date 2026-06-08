@@ -1,6 +1,6 @@
 import { OpenAI } from "openai";
 import chalk from "npm:chalk@5";
-import { SYSTEM_PROMPT, LEAF_AGENT_SYSTEM_PROMPT } from "./prompt.ts";
+import { buildSystemPrompt, PromptOptions } from "./prompt.ts";
 
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_TIMEOUT_MS = 600000;
@@ -40,7 +40,11 @@ export async function generate_code(
     messages: any[],
     model_name: string,
     is_leaf_agent: boolean = false,
-    options?: ApiRetryOptions
+    options?: ApiRetryOptions,
+    promptOpts?: PromptOptions,
+    // Arbitrary extra params (temperature, top_p, seed, ...) spread into the
+    // chat.completions.create call. Passed end-to-end from run(llm_kwargs=...).
+    llmKwargs?: Record<string, unknown> | null
 ): Promise<CodeReturn> {
     const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
     const timeout = options?.timeout ?? DEFAULT_TIMEOUT_MS;
@@ -53,13 +57,16 @@ export async function generate_code(
     });
 
     try {
-        const completion = await client.chat.completions.create({
+        // deno-lint-ignore no-explicit-any
+        const createParams: any = {
             model: model_name,
             messages: [
-                { role: "system", content: is_leaf_agent ? LEAF_AGENT_SYSTEM_PROMPT : SYSTEM_PROMPT },
+                { role: "system", content: buildSystemPrompt(is_leaf_agent, promptOpts ?? {}) },
                 ...messages
             ],
-        });
+            ...(llmKwargs ?? {}),
+        };
+        const completion = await client.chat.completions.create(createParams);
 
         const content = completion.choices[0].message.content || "";
 
@@ -95,6 +102,62 @@ export async function generate_code(
         console.error(chalk.red(`✖ API call failed: ${msg}`));
         throw error;
     }
+}
+
+export interface ConfirmResult {
+    approve: boolean;
+    reason: string;
+    usage: Usage;
+}
+
+/**
+ * Compression-guard self-check. Reuses the subagent's exact opening prefix
+ * (same system prompt + same probe messages) so the provider KV-cache is shared
+ * with the real run, then appends a YES/NO confirmation question. Parsing is
+ * fail-open: anything not clearly starting with "NO" is treated as approval.
+ */
+export async function confirmDelegation(
+    baseMessages: any[],
+    confirmQuestion: string,
+    model_name: string,
+    is_leaf_agent: boolean,
+    options?: ApiRetryOptions,
+    promptOpts?: PromptOptions,
+    llmKwargs?: Record<string, unknown> | null
+): Promise<ConfirmResult> {
+    const client = new OpenAI({
+        apiKey,
+        baseURL,
+        maxRetries: options?.maxRetries ?? DEFAULT_MAX_RETRIES,
+        timeout: options?.timeout ?? DEFAULT_TIMEOUT_MS,
+    });
+
+    // deno-lint-ignore no-explicit-any
+    const createParams: any = {
+        model: model_name,
+        messages: [
+            { role: "system", content: buildSystemPrompt(is_leaf_agent, promptOpts ?? {}) },
+            ...baseMessages,
+            { role: "user", content: confirmQuestion },
+        ],
+        ...(llmKwargs ?? {}),
+    };
+    const completion = await client.chat.completions.create(createParams);
+    const content = (completion.choices[0].message.content || "").trim();
+
+    const usage: Usage = {
+        prompt_tokens: completion.usage?.prompt_tokens ?? 0,
+        completion_tokens: completion.usage?.completion_tokens ?? 0,
+        total_tokens: completion.usage?.total_tokens ?? 0,
+        cached_tokens: completion.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+        reasoning_tokens: completion.usage?.completion_tokens_details?.reasoning_tokens ?? 0,
+        cost: (completion.usage as any)?.cost ?? undefined,
+    };
+
+    // Fail-open: only an explicit "NO" (as the first word) rejects.
+    const firstWord = content.replace(/^[^a-zA-Z]+/, "").slice(0, 4).toUpperCase();
+    const approve = !firstWord.startsWith("NO");
+    return { approve, reason: content || "(no reason given)", usage };
 }
 
 if (import.meta.main) {

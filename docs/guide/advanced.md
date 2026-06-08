@@ -2,11 +2,12 @@
 
 Beyond setting a model and a budget, fast-rlm exposes a few hooks for shaping how the agent actually interacts with the world: registering your own Python tools, controlling what the model sees about them, and handing them credentials without leaking them into the prompt.
 
-This page covers three things:
+This page covers:
 
 1. [Input / Output Signatures](#input-output-signatures) — what the model sees about your tool.
 2. [Tool Calling Process](#tool-calling-process) — how a tool registered in Python ends up callable inside the REPL, and how sub-agents inherit (or don't inherit) tools.
 3. [Environment Variables](#environment-variables) — how to hand credentials to a tool without exposing them to the model.
+4. [MCP servers](#mcp-servers) — connect external Model Context Protocol servers and use their tools, resources, and templates in the REPL.
 
 Inside the REPL the root agent has two built-in tools — `llm_query` and `FINAL` — and may also receive user-defined Python functions as tools. There is no separate tool-calling API: tools are just callables in the REPL namespace, invoked exactly like regular Python functions.
 
@@ -177,3 +178,45 @@ result = fast_rlm.run(
 
 !!! warning "Don't echo secrets back to the model"
     If your tool prints or returns the secret, it will end up in the agent's REPL output, the JSONL log, and potentially the next prompt. Treat the env var like any credential — read it, use it, don't surface it.
+
+---
+
+## MCP servers
+
+In addition to Python tools, fast-rlm can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers and expose their **tools**, **resources**, and **resource templates** inside the REPL. Support is optional and lazy — nothing to install for fast-rlm (Deno fetches the MCP client on first use), and runs without MCP never load it. You only install the servers you want to connect to.
+
+Pass servers to `run(..., mcp_servers={...})`, keyed by name. The transport is chosen by the config shape — `command` ⇒ **stdio** (fast-rlm spawns the server and kills it on exit), `url` ⇒ **HTTP** (the server must already be running):
+
+```python
+import fast_rlm
+
+result = fast_rlm.run(
+    "Read /data/report.md and summarise it in three bullets.",
+    mcp_servers={
+        "fs":  {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"]},
+        "web": {"url": "http://localhost:3333/mcp", "headers": {"Authorization": "Bearer ..."}},
+    },
+)
+```
+
+Inside the REPL the agent gets a small, **lazy** discovery API (the step-0 probe shows only counts + the available servers, never full schemas — so a server with 50 tools doesn't blow the context budget):
+
+```repl
+mcp_list_tools(server=None)              # [{server, name, description}, ...]
+mcp_tool_schema("fs.read_file")          # full input JSON Schema, on demand
+result = await mcp_call("fs", "read_file", path="/data/report.md")   # [async]
+
+mcp_list_resources()                     # static resources
+mcp_list_resource_templates()            # parameterized uris, e.g. "db://record/{id}"
+text = await mcp_read_resource("db://record/42", server="db")        # [async]
+```
+
+`mcp_call` returns the tool's result as a normal Python value into a REPL variable (a `dict` if the server sends `structuredContent`, else the text) — *not* into the model's context. This is what makes MCP-in-the-REPL powerful: a tool can return a 500 KB document, you keep it in a variable, and slice / chunk / `llm_query` it like any other context. Tool errors raise in the REPL so the agent can react.
+
+A few rules mirror the Python-tool model:
+
+- **Sub-agents inherit no MCP access by default.** Grant a child specific servers by name: `await llm_query(task, mcp=["fs"])`.
+- **Server auth stays host-side.** Headers / spawn-env for a server are never shown to the model.
+- **stdio servers are not sandboxed.** A configured shell or filesystem server runs as a full-privilege host subprocess (and grants Deno `--allow-run`). Only point fast-rlm at servers you trust.
+
+See the [MCP servers section in the README](https://github.com/avbiswas/fast-rlm#mcp-servers) and [`examples/mcp_wikipedia_research.py`](https://github.com/avbiswas/fast-rlm/blob/main/examples/mcp_wikipedia_research.py) for a runnable two-server demo (web fetch + filesystem).
