@@ -218,7 +218,7 @@ def run(
 
     # Vertex AI ADC via gcloud CLI needs subprocess permission
     if vertex:
-        cmd.append("--allow-run")
+        cmd.append("--allow-run=gcloud")
 
     cmd += [
         "src/subagents.ts",

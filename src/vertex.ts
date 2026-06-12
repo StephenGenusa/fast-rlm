@@ -22,7 +22,7 @@ async function getAccessToken(): Promise<string> {
 
     // Fall back to gcloud CLI (ADC)
     const cmd = new Deno.Command("gcloud", {
-        args: ["auth", "print-access-token"],
+        args: ["auth", "application-default", "print-access-token"],
         stdout: "piped",
         stderr: "piped",
     });
@@ -121,11 +121,14 @@ export async function createVertexClient(options?: {
     });
 }
 
-export async function refreshVertexClient(client: OpenAI): Promise<OpenAI> {
+export async function refreshVertexClient(client: OpenAI, options?: {
+    maxRetries?: number;
+    timeout?: number;
+}): Promise<OpenAI> {
     if (Date.now() < tokenExpiresAt - TOKEN_REFRESH_MARGIN_MS) {
         return client;
     }
-    return createVertexClient();
+    return createVertexClient(options);
 }
 
 export function isVertexModel(model: string): boolean {

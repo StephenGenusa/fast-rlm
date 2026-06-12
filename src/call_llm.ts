@@ -63,7 +63,7 @@ export async function generate_code(
         if (!vertexClient) {
             vertexClient = await createVertexClient({ maxRetries, timeout });
         } else {
-            vertexClient = await refreshVertexClient(vertexClient);
+            vertexClient = await refreshVertexClient(vertexClient, { maxRetries, timeout });
         }
         client = vertexClient;
     } else {
@@ -155,7 +155,10 @@ export async function confirmDelegation(
                 timeout: options?.timeout ?? DEFAULT_TIMEOUT_MS,
             });
         } else {
-            vertexClient = await refreshVertexClient(vertexClient);
+            vertexClient = await refreshVertexClient(vertexClient, {
+                maxRetries: options?.maxRetries ?? DEFAULT_MAX_RETRIES,
+                timeout: options?.timeout ?? DEFAULT_TIMEOUT_MS,
+            });
         }
         client = vertexClient;
     } else {
