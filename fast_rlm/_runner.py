@@ -157,6 +157,7 @@ def run(
     mcp_servers: Optional[dict[str, dict]] = None,
     llm_kwargs: Optional[dict] = None,
     vertex: bool = False,
+    instruction: Optional[str] = None,
 ) -> dict:
     """Run a fast-rlm query.
 
@@ -197,6 +198,11 @@ def run(
             a raw JSON Schema dict. Validation runs after FINAL is set; on
             failure the agent receives the schema + errors and may retry within
             its remaining call budget.
+        instruction: Optional custom directive appended to the end of the system
+            prompt of every agent (root + all sub-agents, plus delegation-
+            confirmation calls). When provided, a section of the form
+            ``Here is the user's instructions - you must follow it closely:\n
+            {instruction}`` is added. When None, nothing is appended.
 
     Returns:
         Dict with 'results', 'usage', and optionally 'log_file'.
@@ -290,18 +296,24 @@ def run(
             json.dump(llm_kwargs, f)
         cmd += ["--llm-kwargs-file", llm_kwargs_tmpfile]
 
-    # RLMConfig merge: load defaults, overlay user overrides, write to temp file
+    # RLMConfig merge: load defaults, overlay user overrides, write to temp file.
+    # Also written when `instruction` is set (it rides the same --config channel),
+    # even if no explicit config was passed.
     config_tmpfile = None
-    if config is not None:
+    if config is not None or instruction is not None:
         if isinstance(config, RLMConfig):
-            config = asdict(config)
+            cfg_dict = asdict(config)
+        else:
+            cfg_dict = dict(config) if config else {}
 
         default_config_path = engine_dir / "rlm_config.yaml"
         defaults = {}
         if default_config_path.exists():
             with open(default_config_path) as f:
                 defaults = yaml.safe_load(f) or {}
-        merged = {**defaults, **config}
+        merged = {**defaults, **cfg_dict}
+        if instruction is not None:
+            merged["instruction"] = instruction
 
         config_tmpfile = tempfile.mktemp(suffix=".yaml")
         with open(config_tmpfile, "w") as f:

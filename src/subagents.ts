@@ -72,6 +72,7 @@ interface RlmConfig {
     enable_compression_guard?: boolean;
     compression_min_chars?: number;
     compression_ratio?: number;
+    instruction?: string;
 }
 
 function loadConfig(): RlmConfig {
@@ -103,6 +104,10 @@ const ENABLE_STRUCTURED_IO = _config.enable_structured_io ?? true;
 const ENABLE_COMPRESSION_GUARD = _config.enable_compression_guard ?? true;
 const COMPRESSION_MIN_CHARS = _config.compression_min_chars ?? 5000;
 const COMPRESSION_RATIO = _config.compression_ratio ?? 0.6;
+// run(instruction=...) — applies to the ROOT agent only. Sub-agents are NOT given
+// this; they receive an instruction only when their parent passes one explicitly
+// via llm_query(instruction=...). There is intentionally no global instruction.
+const ROOT_INSTRUCTION = _config.instruction ?? null;
 
 function truncateText(text: string): string {
     let truncatedOutput = "";
@@ -157,6 +162,11 @@ export async function subagent(
     // Set by the parent when its delegation tripped the compression heuristic;
     // this agent must self-confirm (YES/NO) before running its loop.
     confirmInfo?: { childChars: number; parentChars: number } | null,
+    // Instruction shown to THIS agent only, appended to its system prompt. Set by
+    // whoever spawned it: run(instruction=...) for the root, or
+    // llm_query(instruction=...) for a child. Never inherited — a child sees only
+    // what its parent explicitly passed, with no carry-on from ancestors.
+    instruction?: string | null,
 ) {
     // Structured I/O ablation: when disabled, ignore any requested output schema
     // (no validation, no schema preamble) and present dict/list contexts as plain
@@ -209,6 +219,8 @@ await micropip.install(["requests", "httpx"])
         child_schema?: unknown,
         child_tool_sources?: unknown,
         child_mcp_servers?: unknown,
+        // Instruction for the spawned child only (from llm_query(instruction=...)).
+        child_instruction?: unknown,
         // Set by batch_llm_query: the batch was already judged once, so skip the
         // per-call compression guard for these children.
         suppress_guard?: unknown,
@@ -256,6 +268,17 @@ await micropip.install(["requests", "httpx"])
             }
             childMcpServers = m as string[];
         }
+        // Instruction for the child only — never inherited from this agent.
+        let childInstruction: string | null = null;
+        if (child_instruction != null) {
+            const ci = pyProxyToJs(child_instruction);
+            if (typeof ci !== "string") {
+                throw new Error(
+                    `llm_query instruction must be a string, got ${typeof ci}`
+                );
+            }
+            childInstruction = ci;
+        }
         console.log("↳ llm_query called");
 
         // Compression guard: if this delegation ships a large, barely-compressed
@@ -283,6 +306,7 @@ await micropip.install(["requests", "httpx"])
             childMcpServers,
             llmKwargs ?? null,
             confirmInfo,
+            childInstruction,
         );
         return output;
     };
@@ -451,13 +475,14 @@ class _LazyQuery:
     batch_llm_query reads its .context up front (one batch judge) and runs it
     with the guard suppressed.
     """
-    __slots__ = ("context", "schema", "tools", "mcp")
+    __slots__ = ("context", "schema", "tools", "mcp", "instruction")
 
-    def __init__(self, context, schema, tools, mcp):
+    def __init__(self, context, schema, tools, mcp, instruction):
         self.context = context
         self.schema = schema
         self.tools = tools
         self.mcp = mcp
+        self.instruction = instruction
 
     def __await__(self):
         return self._run(False).__await__()
@@ -474,13 +499,13 @@ class _LazyQuery:
                 else:
                     _tool_sources.append(_inspect.getsource(_t))
         _mcp = list(self.mcp) if self.mcp else None
-        _result = await __js_llm_query__(self.context, self.schema, _tool_sources, _mcp, suppress)
+        _result = await __js_llm_query__(self.context, self.schema, _tool_sources, _mcp, self.instruction, suppress)
         if hasattr(_result, "to_py"):
             return _result.to_py()
         return _result
 
 
-def llm_query(context, schema=None, *, tools=None, mcp=None):
+def llm_query(context, schema=None, *, tools=None, mcp=None, instruction=None):
     """Recursively query a sub-agent. Use 'await llm_query(...)'.
 
     Args:
@@ -492,8 +517,12 @@ def llm_query(context, schema=None, *, tools=None, mcp=None):
         mcp: optional list of MCP server-name strings to grant the sub-agent.
             By default the sub-agent inherits NO MCP servers; name the ones it
             may use (e.g. mcp=["fsio"]) and it gets that server's tools/resources.
+        instruction: optional string directive shown ONLY to this sub-agent
+            (appended to its system prompt). It is not inherited by the child's
+            own sub-agents and does not carry over from you — pass it again on
+            each llm_query call where you want it to apply.
     """
-    return _LazyQuery(context, schema, tools, mcp)
+    return _LazyQuery(context, schema, tools, mcp, instruction)
 
 
 async def batch_llm_query(*queries):
@@ -747,6 +776,7 @@ Output:\n${stdoutBuffer.trim()}
         enableTools: ENABLE_TOOLS,
         enableStructuredIo: ENABLE_STRUCTURED_IO,
         enableCompressionGuard: ENABLE_COMPRESSION_GUARD,
+        instruction: instruction ?? null,
     };
     const apiOpts = { maxRetries: API_MAX_RETRIES, timeout: API_TIMEOUT_MS };
 
@@ -1012,7 +1042,8 @@ if (import.meta.main) {
         }
 
         // Root agent: mcpAllowedServers = null → sees all configured servers.
-        out = await subagent(query_context, 0, undefined, rootSchema, rootTools, rootEnv, mcpHandle, null, rootLlmKwargs);
+        // ROOT_INSTRUCTION (from run(instruction=...)) applies to the root only.
+        out = await subagent(query_context, 0, undefined, rootSchema, rootTools, rootEnv, mcpHandle, null, rootLlmKwargs, undefined, ROOT_INSTRUCTION);
 
         // Final result is already logged inside subagent()
         // Show global usage across all runs

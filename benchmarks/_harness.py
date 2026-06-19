@@ -337,6 +337,8 @@ def base_argparser(description: str) -> argparse.ArgumentParser:
                    help="Model for both root + sub agents (default: minimax/minimax-m3).")
     p.add_argument("--primary-agent", default=None, help="Override root-agent model.")
     p.add_argument("--sub-agent", default=None, help="Override sub-agent model.")
+    p.add_argument("--max-depth", type=int, default=None,
+                   help="Max recursive subagent depth (default: RLMConfig's 3).")
     # Budget caps (cumulative across root + all subagents). None -> RLMConfig default.
     p.add_argument("--max-prompt-tokens", type=int, default=None,
                    help="Cumulative prompt-token cap (default: RLMConfig's 200000).")
@@ -411,4 +413,6 @@ def config_from_args(args) -> RLMConfig:
         cfg.max_completion_tokens = args.max_completion_tokens
     if getattr(args, "max_money", None) is not None:
         cfg.max_money_spent = args.max_money
+    if getattr(args, "max_depth", None) is not None:
+        cfg.max_depth = args.max_depth
     return cfg

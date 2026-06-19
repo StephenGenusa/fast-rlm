@@ -220,6 +220,41 @@ Behavior:
 - Tools read them with the normal `os.environ["..."]` (do the `import os` inside the tool body — see the self-containment rule above).
 
 
+## Custom instructions
+
+Pass a directive through the `instruction` kwarg on `fast_rlm.run(...)`. When provided, it is appended to the **end** of the agent's system prompt:
+
+```
+Here is the user's instructions - you must follow it closely:
+{instruction}
+```
+
+```python
+result = fast_rlm.run(
+    "Summarize the attached incident report.",
+    instruction="Write all output in formal British English and never use bullet points.",
+)
+```
+
+**Instructions apply to one agent only — they are never inherited.** `run(instruction=...)` configures the **root agent** and nothing else. Sub-agents start with no instruction; to give a sub-agent one, the parent must pass it explicitly when it delegates:
+
+```python
+# inside an agent's REPL — instruct the child you spawn
+result = await llm_query(
+    chunk,
+    instruction="Extract only dollar amounts; return them as a JSON list.",
+)
+```
+
+This is a recursive, no-carry-on design: each agent sees only the instruction its spawner handed it. A child does not inherit its parent's instruction, and the child's own `llm_query(...)` calls start fresh unless it passes `instruction=` again. There is intentionally no global, run-wide instruction.
+
+Behavior:
+
+- `instruction` must be a `str`. When omitted (`None`), nothing is appended and the prompt is unchanged.
+- Because it is appended *after* the built-in prompt, a forceful instruction can override default behavior (e.g. output format or even the task itself). Keep it focused on *how* to answer rather than restating the task.
+- `run(instruction=...)` is a per-call argument, not part of `RLMConfig`; pass it directly to `run(...)`. The in-REPL form is `llm_query(..., instruction=...)`.
+
+
 ## MCP servers
 
 fast-rlm can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers and expose their tools and resources inside the REPL. The agent calls them with `await mcp_call(server, tool, **kwargs)` and reads resources with `await mcp_read_resource(uri)` — just like any other REPL function.

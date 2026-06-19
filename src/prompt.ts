@@ -16,7 +16,7 @@ The REPL environment is initialized with:
 
 2. A \`llm_query\` function that allows you to query an LLM (that can handle around 100K chars) inside your REPL environment. This function is asynchronous, so you must use \`await llm_query(...)\`. The return value is the actual Python object that the subagent passed to FINAL (e.g. a list, dict, string, etc.).
 
-   \`llm_query\` accepts either a **string** OR a **dict** as its context argument — the child subagent will see the same flat-schema probe described above. When you have structured data to hand off, pass it as a dict (e.g. \`await llm_query({"task": "...", "items": chunk})\`) rather than re-stringifying it; this saves the child from re-parsing.
+   \`llm_query\` accepts either a **string** OR a **dict** as its context argument — the child subagent will see the same flat-schema probe described above. Put the DIRECTIVE in the \`instruction=\` keyword (see below) and pass only the DATA as the context. When the data is structured, pass it as a dict of data fields (e.g. \`await llm_query({"items": chunk}, instruction="Pick the items that are valid dates.")\`) rather than re-stringifying it; this saves the child from re-parsing.
 
 Do NOT wrap the result in eval() or json.loads(); use it directly. That said, you must use python to minimize the amount of characters that the LLM can see as much as possible.
 
@@ -34,13 +34,21 @@ def filter_short(items, n=20):
     """Keep items shorter than n characters."""
     return [x for x in items if len(x) < n]
 
-result = await llm_query("Pick the best short titles from these items.", schema=None, tools=[filter_short, search])
+titles = [...]   # the DATA to hand off (a list[str])
+result = await llm_query(
+    titles,
+    instruction="Pick the best short titles from this list and return them as a Python list. Use filter_short to drop overly long ones first.",
+    schema=None,
+    tools=[filter_short, search],
+)
 \`\`\`
+
+Notice the split: the list of items is the context (the data), and the task lives in \`instruction=\`. Do not paste the task into the context string.
 
 Here is another example about websearch tools. Remember if your subagent needs to websearch, you need to explicitly pass the websearch tool to the subagent.
 
 \`\`\`repl
-result = await llm_query("Websearch this query: {query}", schema=None, tools=[search])
+result = await llm_query(query, instruction="Web-search this query using the search tool and return the top relevant findings.", schema=None, tools=[search])
 \`\`\`
 
 If you do not pass the tool to your subagent, it will not be able to use it.
@@ -49,6 +57,17 @@ Important rules about tools:
 - Sub-agents do NOT automatically inherit your tools. If you want a child to have a tool, you MUST pass it explicitly via \`tools=[...]\`. This applies both to tools pre-loaded into your REPL and to tools you define yourself.
 - Tools must be self-contained: do imports INSIDE the function body, and do not rely on REPL-level variables outside the function's arguments. A tool that references outer variables will fail in the sub-agent's REPL.
 - The sub-agent sees the tool's signature and docstring, not its source.
+
+** How to call llm_query: directive vs data **
+Keep the two arguments separate and you will get far better results:
+- The \`instruction=\` keyword carries the DIRECTIVE — what the child should do and how (output shape, constraints, verbatim-vs-summary). It is appended to the child's system prompt.
+- The context (first positional argument) carries the DATA — the actual items/text/dict the child should work on. Do NOT bury the task inside the data; pass it via \`instruction=\`.
+
+\`\`\`repl
+result = await llm_query(items, instruction="Pick the items that are valid dates and return them as a Python list.")
+\`\`\`
+
+The child does not inherit any instruction automatically — pass \`instruction=\` on each call where you want one. (You may still embed a task inside a dict context for backwards-compatibility, but \`instruction=\` is preferred and clearer.)
 
 ** MCP tools & resources (when applicable) **
 Your REPL may also have access to tools and resources from external MCP servers. If so, the initial probe shows a short "MCP:" line with the tool/resource counts and the server names — it does NOT dump every schema (that would waste context). Discover and use them lazily:
@@ -78,7 +97,7 @@ You can require a subagent's FINAL value to conform to a JSON Schema by passing 
 
 \`\`\`repl
 schema = {"type": "array", "items": {"type": "string"}}
-names = await llm_query("Return a JSON list of fruit names.", schema=schema, tools=[])
+names = await llm_query(context["produce_section"], instruction="Return every fruit name mentioned, as a JSON list of strings.", schema=schema, tools=[])
 \`\`\`
 
 ** Input schema **
@@ -87,8 +106,8 @@ When passing large context, it is better to pass it as a dictionary.
 
 \`\`\`repl
 schema = {"type": "array", "items": {"type": "string"}}
-input = {"task": "...", "context": "...", "buffers": "...", "query": "..."}
-result = await llm_query(input, schema=schema, tools=[search])
+data = {"context": "...", "buffers": "...", "query": "..."}   # DATA fields only — no task text
+result = await llm_query(data, instruction="...what the child should do with this data...", schema=schema, tools=[search])
 \`\`\`
 
 
@@ -115,13 +134,13 @@ For PARALLEL delegation, use \`await batch_llm_query(llm_query(c1), llm_query(c2
 \`\`\`repl
 # Map a question over chunks, in parallel, with a single compression check:
 chunks = [context[i:i+8000] for i in range(0, len(context), 8000)]
-results = await batch_llm_query(*[llm_query({"task": "Find any mention of X.", "context": c}) for c in chunks])
+results = await batch_llm_query(*[llm_query(c, instruction="Find any mention of X and quote it verbatim; reply exactly 'none' if absent.") for c in chunks])
 \`\`\`
 
 ** How to control subagent behavior **
-- When calling an \`llm_query\` sometimes it is best for you as a parent agent to read actual context picked from the data. In this case, instruct your subagent to specifically use FINAL by slicing important sections and returning it verbatim. No need to autoregressively generate a summarized answer. 
+- When calling an \`llm_query\` sometimes it is best for you as a parent agent to read actual context picked from the data. In this case, use \`instruction=\` to tell your subagent to FINAL the important sections sliced and returned verbatim. No need to autoregressively generate a summarized answer.
 
-- In other times, when you need your llm call to summarize or paraphrase information, they will need to autoregressively generate the answer exploring their context, so you can instruct them in your task prompt to do that.
+- In other times, when you need your llm call to summarize or paraphrase information, they will need to autoregressively generate the answer exploring their context, so you can ask them to do that via \`instruction=\`.
 
 - By default, the agent plans and decides for itself how it must complete a task!
 
@@ -134,12 +153,12 @@ results = await batch_llm_query(*[llm_query({"task": "Find any mention of X.", "
 This is a multi-turn environment. You do not need to return your answer using FINAL in the first attempt. Before you return the answer, it is always advisable to print it out once to inspect that the answer is correctly formatted and working. This is an iterative environment, and you should use print() statement when possible instead of overconfidently hurry to answer in one turn.
 When returning responses from subagent, it is better to pause and review their answer once before proceeding to the next step. This is true for single subagents, parallel subagents, or a sequence of subagents ran in a for loop.
 Your REPL environment acts like a jupyter-notebook, so your past code executions and variables are maintained in the python runtime. This means YOU MUST NOT NEED to rewrite old code. Be careful to NEVER accidentally delete important variables, especially the \`context\` variable because that is an irreversible move.
-You will only be able to see truncated outputs from the REPL environment, so you should use the query LLM function on variables you want to analyze. You will find this function especially useful when you have to analyze the semantics of the context. To ask a subagent to analyze a variable, just pass the task description AND the context using \`llm_query()\`
+You will only be able to see truncated outputs from the REPL environment, so you should use the query LLM function on variables you want to analyze. You will find this function especially useful when you have to analyze the semantics of the context. To ask a subagent to analyze a variable, pass the variable as the context and put the task in \`instruction=\`, e.g. \`await llm_query(my_var, instruction="...the task...")\`.
 You can use variables as buffers to build up your final answer. Variables can be constructed by your own manipulation of the context, or by simply using the output of llm_query()
 Make sure to explicitly look through as much context in REPL before answering your query. An example strategy is to first look at the context and figure out a chunking strategy, then break up the context into smart chunks, and query an LLM per chunk with a particular question and save the answers to a buffer, then query an LLM with all the buffers to produce your final answer.
 You can use the REPL environment to help you understand your context, especially if it is large. Remember that your sub-LLMs are powerful -- they can fit around 500K characters in their context window, so don't be afraid to put a lot of context into them. For example, a viable strategy is to feed 10 documents per sub-LLM query. Analyze your input data and see if it is sufficient to just fit it in a few sub-LLM calls!
-When calling llm_query(), you must also give your instructions at the beginning of the whatever context you are adding. If you only pass the context into the subagent without any instructions, it will not be able to conduct it's task!
-Therefore, ensure that you specify what task you need your subagent to do, to guarantee that they work. 
+When calling llm_query(), you MUST give the subagent its task via the \`instruction=\` keyword. If you only pass context with no instruction, it will not know what to do and cannot conduct its task!
+Therefore, ensure that you specify in \`instruction=\` exactly what task you need your subagent to do, to guarantee that they work.
 Help them with more instructions such as if the data is a dictionary, list, or any other finding that will help them figure out the task easier. Clarity is important!
 When you want to execute Python code in the REPL environment, wrap it in triple backticks with \`repl\` language identifier. For example, say we want our recursive model to search for the magic number in the context (assuming the context is a string), and the context is very long, so we want to chunk it:
 
@@ -165,7 +184,7 @@ chunk # THIS WILL NOT DISPLAY THE OUTPUT IN THE REPL ENVIRONMENT, YOU WILL JUST 
 
 \`\`\`repl
 chunk = context[: 10000]
-answer = await llm_query({"task": "What is the magic number in the context?", "context": chunk}, schema=None, tools=[])
+answer = await llm_query(chunk, instruction="What is the magic number in this context? Return just the number.", schema=None, tools=[])
 print(answer)
 \`\`\`
 
@@ -175,10 +194,18 @@ As an example, suppose you're trying to answer a question about a book. You can 
 query = "In Harry Potter and the Sorcerer's Stone, did Gryffindor win the House Cup because they led?"
 for i, section in enumerate(context):
     if i == len(context) - 1:
-        buffer = await llm_query({"task": "You are on the last section of the book. Section is provided to you in this dictionary. So far you know the buffers presentend to you in buffers key. Gather from this last section to answer the query: {query}", "context": section, "buffers": buffers, "query": query}, schema=None, tools=[])
+        buffer = await llm_query(
+            {"section": section, "buffers": buffers, "query": query},
+            instruction=f"This is the LAST section of the book. Using this section plus the running buffers, answer the query: {query}",
+            schema=None, tools=[],
+        )
         print(f"Based on reading iteratively through the book, the answer is: {buffer}")
     else:
-        buffer = await llm_query({"task": "You are iteratively looking through a book, and are on section {i} of {len(context)}", "context": section, "query": query}, schema=None, tools=[])
+        buffer = await llm_query(
+            {"section": section, "query": query},
+            instruction=f"You are iteratively reading a book, now on section {i} of {len(context)}. Note anything in this section relevant to the query.",
+            schema=None, tools=[],
+        )
         print(f"After section {i} of {len(context)}, you have tracked: {buffer}")
 \`\`\`
 
@@ -195,14 +222,14 @@ for i in range(10):
     else:
         chunk_str = "\\n".join(context[i * chunk_size:])
 
-    task = llm_query(f"Try to answer the following query: {query}. Here are the documents:\\n{chunk_str}. Only answer if you are confident in your answer based on the evidence.", schema=None, tools=[])
+    task = llm_query(chunk_str, instruction=f"Try to answer this query: {query}. Only answer if you are confident based on the evidence in these documents; otherwise say you are unsure.", schema=None, tools=[])
     tasks.append(task)
 
 answers = await batch_llm_query(*tasks)   # parallel; one compression check for the whole batch
 for i, answer in enumerate(answers):
     print(f"I got the answer from chunk {i}: {answer}")
 
-final_answer = await llm_query({"task": "Aggregating all the answers per chunk, answer the original query about total number of jobs: {query}\\n\\nAnswers: \\n" + "\\n".join(answers)}, schema=None, tools=[])
+final_answer = await llm_query("\\n".join(answers), instruction=f"Aggregating these per-chunk answers, answer the original query about the total number of jobs: {query}", schema=None, tools=[])
 \`\`\`
 
 As a final example, after analyzing the context and realizing its separated by Markdown headers, we can maintain state through buffers by chunking the context by headers, and iteratively querying an LLM over it. Do note that this pattern is slow, so only do it if ABSOLUTELY necessary:
@@ -215,10 +242,10 @@ buffers = []
 for i in range(1, len(sections), 2):
     header = sections[i]
     info = sections[i + 1]
-    summary = await llm_query({"task": "Summarize this {header} section: {info}", "context": info}, schema=None, tools=[])
+    summary = await llm_query(info, instruction=f"Summarize this '{header}' section concisely.", schema=None, tools=[])
     buffers.append(f"{header}: {summary}")
 
-final_answer = await llm_query(f"Based on these summaries, answer the original query: {query}\\n\\nSummaries:\\n" + "\\n".join(buffers))
+final_answer = await llm_query("\\n".join(buffers), instruction=f"Based on these section summaries, answer the original query: {query}")
 \`\`\`
 
 In the next step, we can return FINAL(final_answer).
@@ -360,6 +387,7 @@ export interface PromptOptions {
     enableTools?: boolean; // default true
     enableStructuredIo?: boolean; // default true
     enableCompressionGuard?: boolean; // default true (root prompt only)
+    instruction?: string | null; // optional caller directive appended at the end
 }
 
 // Remove text from startMarker (inclusive) up to endMarker (exclusive).
@@ -403,6 +431,13 @@ export function buildSystemPrompt(isLeaf: boolean, opts: PromptOptions = {}): st
                 ? "You can interact with the Python REPL by writing Python code."
                 : "** Understanding the level of detail user is asking for **",
         );
+    }
+
+    // Caller-supplied directive: appended verbatim at the very end so it applies
+    // to both root and leaf agents and is never stripped by the toggles above.
+    const instruction = opts.instruction;
+    if (instruction && instruction.trim().length > 0) {
+        p += `\n\nHere is the user's instructions - you must follow it closely:\n${instruction}\n`;
     }
     return p;
 }
