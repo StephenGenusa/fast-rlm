@@ -3,6 +3,7 @@ import chalk from "npm:chalk@5";
 import { buildSystemPrompt, PromptOptions } from "./prompt.ts";
 import { createVertexClient, refreshVertexClient, isVertexModel, stripVertexPrefix } from "./vertex.ts";
 import { confirmAcpDelegation, generateAcpCode, isAcpModel } from "./acp.ts";
+import { anthropicApiKey, confirmAnthropicDelegation, generateAnthropicCode, isAnthropicModel } from "./anthropic.ts";
 
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_TIMEOUT_MS = 600000;
@@ -28,17 +29,32 @@ export interface CodeReturn {
     usage: Usage;
 }
 
-const apiKey = Deno.env.get("RLM_MODEL_API_KEY") || Deno.env.get("OPENROUTER_API_KEY");
+// The default backend is any OpenAI-compatible API (OpenAI, DeepSeek, OpenRouter,
+// or anything else via RLM_MODEL_BASE_URL) — OpenRouter is just the default base
+// URL, not a requirement. The key resolves from RLM_MODEL_API_KEY, then
+// OPENAI_API_KEY, then OPENROUTER_API_KEY.
+const apiKey = Deno.env.get("RLM_MODEL_API_KEY") || Deno.env.get("OPENAI_API_KEY") || Deno.env.get("OPENROUTER_API_KEY");
 const baseURL = Deno.env.get("RLM_MODEL_BASE_URL") || "https://openrouter.ai/api/v1";
 
-// Vertex AI uses ADC — no static API key needed. Only validate key for non-Vertex runs.
 const vertexMode = Deno.env.get("RLM_VERTEX_AI") === "1";
-if (!apiKey && !vertexMode) {
-    throw new Error(
-        "RLM_MODEL_API_KEY environment variable is missing or empty. " +
-        "Set it to your API key, e.g.: export RLM_MODEL_API_KEY='sk-...'\n" +
-        "For Vertex AI, set RLM_VERTEX_AI=1 and GOOGLE_CLOUD_PROJECT instead."
-    );
+
+// Credentials are validated per backend at the point of use, not eagerly at
+// startup — a run that only uses ACP agents needs no API key at all. The
+// OpenAI-compatible path calls this when it's the backend actually selected;
+// Vertex (ADC) and native Anthropic (ANTHROPIC_API_KEY) validate their own.
+function requireModelApiKey(): string {
+    if (!apiKey) {
+        throw new Error(
+            "No API key for the OpenAI-compatible backend. Set RLM_MODEL_API_KEY " +
+            "(or OPENAI_API_KEY) to your key, e.g.: export RLM_MODEL_API_KEY='sk-...'. " +
+            "Point it at any OpenAI-compatible endpoint (OpenAI, DeepSeek, OpenRouter, …) " +
+            "via RLM_MODEL_BASE_URL.\n" +
+            "For Vertex AI, set RLM_VERTEX_AI=1 and GOOGLE_CLOUD_PROJECT instead.\n" +
+            "For Anthropic models, set ANTHROPIC_API_KEY instead.\n" +
+            "(ACP agents such as acp:opencode need no API key.)",
+        );
+    }
+    return apiKey;
 }
 
 let vertexClient: OpenAI | null = null;
@@ -58,6 +74,18 @@ export async function generate_code(
         return generateAcpCode(messages, model_name, is_leaf_agent, options, promptOpts, llmKwargs);
     }
 
+    // Claude models prefer the native Anthropic API (anthropic.ts) when a key is
+    // set; on any failure fall through to the OpenAI/OpenRouter path below with the
+    // original model string. Explicit Vertex (prefix or RLM_VERTEX_AI) wins.
+    if (isAnthropicModel(model_name) && anthropicApiKey() && !isVertexModel(model_name) && !vertexMode) {
+        try {
+            return await generateAnthropicCode(messages, model_name, is_leaf_agent, options, promptOpts, llmKwargs);
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            console.error(chalk.yellow(`⚠ Anthropic endpoint unavailable (${msg}); falling back to ${baseURL}`));
+        }
+    }
+
     const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
     const timeout = options?.timeout ?? DEFAULT_TIMEOUT_MS;
 
@@ -74,7 +102,7 @@ export async function generate_code(
         client = vertexClient;
     } else {
         client = new OpenAI({
-            apiKey,
+            apiKey: requireModelApiKey(),
             baseURL,
             maxRetries: maxRetries,
             timeout: timeout,
@@ -154,6 +182,15 @@ export async function confirmDelegation(
         return confirmAcpDelegation(baseMessages, confirmQuestion, model_name, is_leaf_agent, options, promptOpts, llmKwargs);
     }
 
+    if (isAnthropicModel(model_name) && anthropicApiKey() && !isVertexModel(model_name) && !vertexMode) {
+        try {
+            return await confirmAnthropicDelegation(baseMessages, confirmQuestion, model_name, is_leaf_agent, options, promptOpts, llmKwargs);
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            console.error(chalk.yellow(`⚠ Anthropic endpoint unavailable (${msg}); falling back to ${baseURL}`));
+        }
+    }
+
     let client: OpenAI;
     let resolvedModel = model_name;
 
@@ -173,7 +210,7 @@ export async function confirmDelegation(
         client = vertexClient;
     } else {
         client = new OpenAI({
-            apiKey,
+            apiKey: requireModelApiKey(),
             baseURL,
             maxRetries: options?.maxRetries ?? DEFAULT_MAX_RETRIES,
             timeout: options?.timeout ?? DEFAULT_TIMEOUT_MS,

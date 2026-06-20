@@ -53,10 +53,10 @@ export RLM_MODEL_API_KEY=sk-or-...
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `RLM_MODEL_API_KEY` | API key for your LLM provider | — |
+| `RLM_MODEL_API_KEY` | API key for the OpenAI-compatible backend (falls back to `OPENAI_API_KEY`, then `OPENROUTER_API_KEY`) | — |
 | `RLM_MODEL_BASE_URL` | OpenAI-compatible base URL | `https://openrouter.ai/api/v1` |
 
-That's all you need to get started. By default, fast-rlm uses [OpenRouter](https://openrouter.ai); you can point it at any OpenAI-compatible API by setting `RLM_MODEL_BASE_URL`.
+That's all you need to get started. By default, fast-rlm uses [OpenRouter](https://openrouter.ai); you can point it at any OpenAI-compatible API by setting `RLM_MODEL_BASE_URL`. fast-rlm also runs on Vertex AI, the native Anthropic API, and local ACP coding agents — see **Backend setup** at the end of this README.
 
 
 ## Quick Start
@@ -104,6 +104,19 @@ The same file loading is available from Python — `run()` accepts an `input_fil
 ```python
 fast_rlm.run(input_file="reviews.json", instruction="Aggregate into a verdict", config=config)
 ```
+
+## Model backends
+
+The `primary_agent` / `sub_agent` string selects one of four backends:
+
+| Mode | Example `primary_agent` | What it is |
+|---|---|---|
+| **Any OpenAI-compatible API** (default) | `"gpt-5-mini"`, `"deepseek-chat"`, `"minimax/minimax-m3"` | OpenAI, DeepSeek, OpenRouter (default), or any compatible endpoint |
+| **Vertex AI** | `"vertex/claude-sonnet-4-6"` | Google Cloud (ADC auth) |
+| **Anthropic API** | `"claude-haiku-4-5"`, `"anthropic/claude-sonnet-4-6"` | Native Anthropic; falls back to the OpenAI-compatible endpoint if no key |
+| **ACP coding agent** | `"acp:codex"`, `"acp:claude-code"`, `"acp:opencode"` | Drives a local coding agent, read-only |
+
+Set the credential only for the backend(s) you use — see **Backend setup** at the end of this README. An ACP-only run needs no API key at all.
 
 ## Arbitrarily Long Context
 
@@ -472,6 +485,66 @@ uv sync --extra benchmarks
 uv run benchmarks/oolong_synth_benchmark.py
 uv run benchmarks/longbench_benchmark.py
 ```
+
+---
+
+## Backend setup
+
+fast-rlm picks a backend from the `primary_agent`/`sub_agent` string (see [Model backends](#model-backends)). **Set the credential only for the backend(s) you use** — each is validated at point of use, so an ACP-only run needs no API key at all.
+
+### 1. OpenAI-compatible API (default)
+
+Any OpenAI-compatible endpoint — OpenAI, DeepSeek, OpenRouter (default), or anything else.
+
+```bash
+export RLM_MODEL_API_KEY=sk-...                       # or OPENAI_API_KEY, or OPENROUTER_API_KEY
+export RLM_MODEL_BASE_URL=https://api.deepseek.com    # optional; defaults to OpenRouter
+```
+```yaml
+primary_agent: "deepseek-chat"     # or "gpt-5-mini", "minimax/minimax-m3", ...
+```
+
+### 2. Vertex AI
+
+Google Cloud, via Application Default Credentials (no static key). Prefix the model with `vertex/`, or set `RLM_VERTEX_AI=1` (Python: `run(..., vertex=True)`) to route every model through Vertex.
+
+```bash
+gcloud auth application-default login
+export GOOGLE_CLOUD_PROJECT=your-project
+```
+```yaml
+primary_agent: "vertex/claude-sonnet-4-6"
+```
+
+### 3. Anthropic API (native)
+
+Claude models (`claude-*` or `anthropic/claude-*`) use the native Anthropic API when `ANTHROPIC_API_KEY` is set. If the native call is unavailable, fast-rlm transparently falls back to the OpenAI-compatible endpoint — so `anthropic/...` strings keep working through OpenRouter even without an Anthropic key.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_BASE_URL=https://my-proxy.example.com   # optional; defaults to https://api.anthropic.com
+```
+```yaml
+primary_agent: "claude-haiku-4-5"        # or "anthropic/claude-sonnet-4-6"
+```
+Token usage is reported (so budgets apply); cost shows `Unknown` (the SDK returns no cost).
+
+### 4. ACP coding agent
+
+Drives a local coding agent (Claude Code, Codex, opencode) read-only — no API key needed (the agent uses its own CLI login). Because token/cost budgets don't apply to ACP, `max_global_calls` defaults to `50` for ACP runs. See the **ACP agents** section below for presets and the backdoor.
+
+```yaml
+primary_agent: "acp:opencode"      # or "acp:claude-code", "acp:codex"
+```
+
+### Credential resolution
+
+| Backend | Selector | Credential |
+|---|---|---|
+| OpenAI-compatible | unprefixed (e.g. `gpt-5-mini`) | `RLM_MODEL_API_KEY` → `OPENAI_API_KEY` → `OPENROUTER_API_KEY` (+ optional `RLM_MODEL_BASE_URL`) |
+| Vertex AI | `vertex/…` or `RLM_VERTEX_AI=1` | ADC + `GOOGLE_CLOUD_PROJECT` |
+| Anthropic | `claude-…` / `anthropic/…` | `ANTHROPIC_API_KEY` (or `RLM_ANTHROPIC_API_KEY`) (+ optional `ANTHROPIC_BASE_URL`) |
+| ACP | `acp:…` | none (agent's own CLI login) |
 
 ---
 
