@@ -77,6 +77,12 @@ class RLMConfig:
     enable_compression_guard: bool = True
     compression_min_chars: int = 5000
     compression_ratio: float = 0.6
+    # ACP backdoor: register non-preset Agent Client Protocol agents by command,
+    # then select one via primary_agent/sub_agent="acp:<name>". Built-in presets
+    # (acp:claude-code, acp:codex, acp:opencode) need no entry here. Example:
+    #   acp_agents={"hermes": {"command": "hermes", "args": ["acp"]}}
+    # Each value: {command, args?, readonly_mode?, model?, env?}.
+    acp_agents: Optional[dict] = None
 
     @classmethod
     def default(cls) -> "RLMConfig":
@@ -256,6 +262,12 @@ def run(
     # Vertex AI ADC via gcloud CLI needs subprocess permission
     if vertex:
         cmd.append("--allow-run=gcloud")
+
+    # ACP agents are spawned as child processes (e.g. npx/opencode), so the Deno
+    # host needs --allow-run when either agent is an "acp:" model.
+    _agents = [merged_config.get("primary_agent") or "", merged_config.get("sub_agent") or ""]
+    if any(a.startswith("acp:") for a in _agents):
+        cmd.append("--allow-run")
 
     cmd += [
         "src/subagents.ts",

@@ -2,6 +2,7 @@ import { OpenAI } from "openai";
 import chalk from "npm:chalk@5";
 import { buildSystemPrompt, PromptOptions } from "./prompt.ts";
 import { createVertexClient, refreshVertexClient, isVertexModel, stripVertexPrefix } from "./vertex.ts";
+import { confirmAcpDelegation, generateAcpCode, isAcpModel } from "./acp.ts";
 
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_TIMEOUT_MS = 600000;
@@ -20,7 +21,7 @@ export interface Usage {
     cost: number | undefined;
 }
 
-interface CodeReturn {
+export interface CodeReturn {
     code: string;
     success: boolean;
     message: any;
@@ -52,6 +53,11 @@ export async function generate_code(
     // chat.completions.create call. Passed end-to-end from run(llm_kwargs=...).
     llmKwargs?: Record<string, unknown> | null
 ): Promise<CodeReturn> {
+    // ACP agents (e.g. "acp:codex") are a separate backend — see acp.ts.
+    if (isAcpModel(model_name)) {
+        return generateAcpCode(messages, model_name, is_leaf_agent, options, promptOpts, llmKwargs);
+    }
+
     const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
     const timeout = options?.timeout ?? DEFAULT_TIMEOUT_MS;
 
@@ -144,6 +150,10 @@ export async function confirmDelegation(
     promptOpts?: PromptOptions,
     llmKwargs?: Record<string, unknown> | null
 ): Promise<ConfirmResult> {
+    if (isAcpModel(model_name)) {
+        return confirmAcpDelegation(baseMessages, confirmQuestion, model_name, is_leaf_agent, options, promptOpts, llmKwargs);
+    }
+
     let client: OpenAI;
     let resolvedModel = model_name;
 

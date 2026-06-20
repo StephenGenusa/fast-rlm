@@ -12,6 +12,7 @@ Usage:
     uv run benchmarks/oolong_synth_benchmark.py -n 10
     uv run benchmarks/oolong_synth_benchmark.py -n 5 --task counting
     uv run benchmarks/oolong_synth_benchmark.py -n 5 --max-context-len 8000
+    uv run benchmarks/oolong_synth_benchmark.py --model acp:opencode   # drive an ACP agent
 """
 
 import ast

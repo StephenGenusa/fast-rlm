@@ -158,7 +158,7 @@ def filter_short(items: list[str], max_len: int = 20) -> list[str]:
     """Return only items shorter than max_len."""
     return [x for x in items if len(x) < max_len]
 
-result = fast_rlm.run("Pick the short titles from the list.", tools=[filter_short])
+result = fast_rlm.run("Pick the short titles from the list." + str(list_of_titles), tools=[filter_short])
 ```
 
 Two rules apply to any tool that may be handed to a sub-agent:
@@ -443,6 +443,64 @@ uv sync --extra benchmarks
 uv run benchmarks/oolong_synth_benchmark.py
 uv run benchmarks/longbench_benchmark.py
 ```
+
+---
+
+## ACP agents (Claude Code, Codex, opencode, …)
+
+Besides OpenAI-compatible and Vertex models, fast-rlm can use a coding agent that
+speaks the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) as the
+"brain". The agent is prompted with fast-rlm's system prompt + history and replies
+with a ```` ```repl ```` block, which fast-rlm executes in its own Pyodide sandbox —
+exactly like any other model. **The agent itself runs read-only and never writes
+files or runs the code; fast-rlm does.**
+
+Select one with an `acp:` prefix on `primary_agent`/`sub_agent` (mirrors the
+`vertex/` convention):
+
+```yaml
+primary_agent: "acp:claude-code"
+sub_agent:     "acp:codex?model=gpt-5.5-codex"   # ?model= is optional
+```
+
+```python
+run(query, config=RLMConfig(primary_agent="acp:opencode"))
+```
+
+**Built-in presets** (verified): `acp:claude-code`, `acp:codex`, `acp:opencode`.
+Claude Code and Codex are launched via their `npx` adapters, so **Node/npx must be
+on PATH** and the agent itself must already be logged in (e.g. `claude /login`,
+`codex login`, `opencode auth login`).
+
+**Backdoor — any other ACP agent.** Register it by command under `acp_agents`, then
+select it by name. Built-in presets need no entry; a registered name overrides a
+preset of the same name.
+
+```python
+run(query, config=RLMConfig(
+    primary_agent="acp:hermes",
+    acp_agents={
+        "hermes": {"command": "hermes", "args": ["acp"]},
+        "cursor": {"command": "npx", "args": ["-y", "cursor-agent-acp"]},
+    },
+))
+```
+
+Each entry accepts `command`, `args?`, `readonly_mode?` (the agent's read-only mode
+id, if it has one), `model?`, `auth_method?` (ACP auth method id — pinning it
+silences the provider's "authMethodId is not configured" warning), and `env?`.
+
+**Safety & caveats:**
+
+- Every ACP agent runs in a throwaway temp `cwd`, so a stray write is contained.
+- When the agent has a read-only session mode (`readonly_mode`), fast-rlm switches
+  into it. The presets do this automatically: opencode/claude-code use `plan` (a
+  hard block); codex uses `read-only` (approval-gated — it may still write if it
+  asks, so the temp `cwd` is its real guardrail).
+- Agents with **no session modes** (e.g. cursor, hermes) are contained by the temp
+  `cwd` alone.
+- ACP agents **don't report token usage**, so cost/token budgets read as zero for
+  them.
 
 ---
 

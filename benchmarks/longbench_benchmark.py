@@ -9,6 +9,7 @@ whole config.
 Usage:
     uv run benchmarks/longbench_benchmark.py                  # 3 narrativeqa samples
     uv run benchmarks/longbench_benchmark.py -n 10 --config hotpotqa
+    uv run benchmarks/longbench_benchmark.py --model acp:opencode   # drive an ACP agent
 """
 
 import itertools

@@ -50,6 +50,7 @@ nav:
   - Guide:
       - Configuration: guide/configuration.md
       - Advanced Customization: guide/advanced.md
+      - ACP Agents: guide/acp-agents.md
       - Log Viewer: guide/log-viewer.md
       - Best Practices & Troubleshooting: guide/tips.md
   - Development:

@@ -10,6 +10,7 @@ filler text and ask the agent to retrieve it. Scored by numeric match.
 Usage:
     uv run benchmarks/niah_benchmark.py                 # 3 needles, ~4k-word haystack
     uv run benchmarks/niah_benchmark.py -n 10 --haystack-words 20000
+    uv run benchmarks/niah_benchmark.py --model acp:opencode   # drive an ACP agent
 """
 
 import random

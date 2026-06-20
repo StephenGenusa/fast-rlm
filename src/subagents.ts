@@ -1,5 +1,4 @@
 import { loadPyodide } from "pyodide";
-import { parse as parseYaml } from "@std/yaml";
 // ajv ships as CJS; Deno's npm interop wraps the default export in a namespace
 // whose `.default` property is the actual constructor.
 // deno-lint-ignore no-explicit-any
@@ -16,6 +15,7 @@ interface ValidateFunction {
     errors?: AjvError[] | null;
 }
 import { confirmDelegation, generate_code, Usage } from "./call_llm.ts";
+import { loadConfig } from "./config.ts";
 // MCP is optional: only the *types* are imported statically (erased at compile,
 // so they pull in nothing at runtime). The implementation in ./mcp.ts — and its
 // heavy `@modelcontextprotocol/sdk` npm dependency — is loaded lazily via dynamic
@@ -52,40 +52,6 @@ function formatValidationErrors(validate: ValidateFunction): string {
             }`;
         })
         .join("\n");
-}
-
-interface RlmConfig {
-    max_calls_per_subagent?: number;
-    max_depth?: number;
-    truncate_len?: number;
-    primary_agent?: string;
-    sub_agent?: string;
-    max_money_spent?: number;
-    max_completion_tokens?: number;
-    max_prompt_tokens?: number;
-    api_max_retries?: number;
-    api_timeout_ms?: number;
-    // Ablation toggles (default true). When false, the capability is removed at
-    // the agent/subagent layer AND stripped from the system prompt.
-    enable_tools?: boolean;
-    enable_structured_io?: boolean;
-    enable_compression_guard?: boolean;
-    compression_min_chars?: number;
-    compression_ratio?: number;
-    instruction?: string;
-}
-
-function loadConfig(): RlmConfig {
-    try {
-        const configIdx = Deno.args.indexOf("--config");
-        const configPath = configIdx !== -1 && Deno.args[configIdx + 1]
-            ? Deno.args[configIdx + 1]
-            : new URL("../rlm_config.yaml", import.meta.url).pathname;
-        const raw = Deno.readTextFileSync(configPath);
-        return (parseYaml(raw) as RlmConfig) ?? {};
-    } catch {
-        return {};
-    }
 }
 
 const _config = loadConfig();

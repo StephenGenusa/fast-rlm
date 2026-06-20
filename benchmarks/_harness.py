@@ -337,6 +337,11 @@ def base_argparser(description: str) -> argparse.ArgumentParser:
                    help="Model for both root + sub agents (default: minimax/minimax-m3).")
     p.add_argument("--primary-agent", default=None, help="Override root-agent model.")
     p.add_argument("--sub-agent", default=None, help="Override sub-agent model.")
+    p.add_argument("--acp-agents", default=None,
+                   help="JSON registry of custom ACP agents for the backdoor, e.g. "
+                        "'{\"hermes\":{\"command\":\"hermes\",\"args\":[\"acp\"]}}'. "
+                        "Prefix with @ to read from a file. Only needed for non-preset "
+                        "agents; presets like acp:opencode work via --model directly.")
     p.add_argument("--max-depth", type=int, default=None,
                    help="Max recursive subagent depth (default: RLMConfig's 3).")
     # Budget caps (cumulative across root + all subagents). None -> RLMConfig default.
@@ -415,4 +420,10 @@ def config_from_args(args) -> RLMConfig:
         cfg.max_money_spent = args.max_money
     if getattr(args, "max_depth", None) is not None:
         cfg.max_depth = args.max_depth
+    if getattr(args, "acp_agents", None):
+        raw = args.acp_agents
+        if raw.startswith("@"):
+            with open(raw[1:]) as f:
+                raw = f.read()
+        cfg.acp_agents = json.loads(raw)
     return cfg
