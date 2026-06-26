@@ -1,642 +1,308 @@
-# fast-rlm
+# Recursive Language Models (RLM)
 
-[![PyPI](https://img.shields.io/pypi/v/fast-rlm)](https://pypi.org/project/fast-rlm/)
-[![GitHub](https://img.shields.io/github/stars/avbiswas/fast-rlm)](https://github.com/avbiswas/fast-rlm)
-[![Docs](https://img.shields.io/badge/docs-avbiswas.github.io%2Ffast--rlm-blue)](https://avbiswas.github.io/fast-rlm/)
+A research synthesis plus a working, **sandboxed** Recursive Language Model
+engine.
 
-A minimal implementation of Recursive Language Models (RLMs) using Deno and Pyodide.
+*This is a work in progress/experimental project because I wanted more than
+the original project offered.*
 
-[GitHub](https://github.com/avbiswas/fast-rlm) | [Documentation](https://avbiswas.github.io/fast-rlm/) | [PyPI](https://pypi.org/project/fast-rlm/)
+An RLM answers a query about a context by treating that context as a **variable
+in a code REPL** instead of stuffing it into the prompt. The root model never
+sees the raw text; it writes Python to inspect, slice, search, and recursively
+sub-query the context, then returns a final answer. The result is a near
+drop-in replacement for a single LLM call (`rlm.complete(query, context)`) that
+works far beyond the context window and resists context rot.
 
-> **Watch the full video on YouTube**
-> **[RLM Tutorial](https://youtu.be/nxaVvvrezbY)**
+Based on Zhang, Kraska & Khattab, *Recursive Language Models* (arXiv:2512.24601).
 
-## What are RLMs
+## The bug this fixes
 
-RLMs are an inference technique where an LLM interacts with arbitrarily long prompts through an external REPL. The LLM can write code to explore, decompose, and transform the prompt. It can recursively invoke sub-agents to complete smaller subtasks. Crucially, sub-agent responses are not automatically loaded into the parent agent's context — they are returned as symbols or variables inside the parent's REPL.
+Naive "recursive prompt" attempts concatenate the query and the long text into
+one string, so the model cannot tell its instructions from its data and gets
+confused. RLM removes that ambiguity **structurally**: the query is the only
+task text the root model sees; the context lives behind a `context` variable;
+sub-calls pass task and data as separate arguments. That invariant holds at every
+level, regardless of file size — a 2 MB file never enters a prompt.
 
-## Support
+## Repository layout
 
-If you find this helpful, consider supporting on Patreon — it hosts all code, projects, slides, and write-ups from the YouTube channel.
-
-[<img src="https://c5.patreon.com/external/logo/become_a_patron_button.png" alt="Become a Patron!" width="200">](https://www.patreon.com/NeuralBreakdownwithAVB)
-
----
-
-## Demo
-
-<video src="https://github.com/user-attachments/assets/fcaeab69-e384-4b26-8d6a-b71c1464e7f2" controls width="100%"></video>
-
----
-
-## Install
-
-```bash
-pip install fast-rlm
 ```
+RLM/
+├── README.md                                  # this file
+├── Recursive_Language_Models_Research_Synthesis.md   # the research paper/synthesis
+└── rlm_engine/                                # the working engine (pip-installable)
+    ├── README.md                              # engine-specific quickstart
+    ├── pyproject.toml
+    ├── package.json                           # declares the pyodide npm dependency
+    ├── rlm/
+    │   ├── __init__.py                         # public API (v0.2.0)
+    │   ├── core.py                             # RLM orchestrator + sub-call routing
+    │   ├── tracing.py                          # Span/Tracer — per-call observability
+    │   ├── tui.py                              # Textual trace viewer (run_tui/live_tui)
+    │   ├── cli.py                              # `rlm` and `rlm-tui` console scripts
+    │   ├── sandbox.py                          # PyodideSandbox (hardened WASM sandbox)
+    │   ├── sandbox_host.mjs                    # Deno/Node host that runs Pyodide
+    │   ├── clients.py                          # Anthropic / OpenAI / LiteLLM / Mock clients
+    │   └── prompts.py                          # root-model system prompt + step prompts
+    ├── docs/
+    │   ├── sandbox.md                          # sandbox threat model & setup
+    │   └── local-models.md                     # vLLM / llama.cpp / Ollama / LM Studio
+    ├── examples/
+    │   ├── niah_demo.py                        # needle-in-a-haystack
+    │   ├── long_doc_qa.py                      # long-document QA
+    │   └── local_vllm_demo.py                  # fully local, sandboxed run
+    └── tests/
+        ├── test_rlm.py                         # offline (mock model, no runtime needed)
+        └── test_sandbox.py                     # real Pyodide WASM sandbox
+```
+
+## Why a sandbox is mandatory
+
+The root model **writes the Python that runs**. That code is untrusted by
+construction, so it executes as CPython-in-WASM (Pyodide) inside a separate
+process with **no network and no API keys**. Its only exit is the
+`llm_query`/`batch_llm_query` channel, which the host controls and uses to make
+the real API calls. Under **Deno** (the production default) the sandbox process
+runs with net/write/run/ffi **and env** denied, and filesystem **read scoped to
+the Deno cache dir** only — so even a WASM escape lands in a process that cannot
+read host files or secrets, reach the network, write, or spawn. On both runtimes
+the subprocess environment is scrubbed of provider API keys (the host process
+makes the real calls). Full threat model in `rlm_engine/docs/sandbox.md`.
+
+---
+
+## Setup
 
 ### Requirements
 
-- Python 3.10+
-- [Deno](https://deno.land/) 2+
-  - macOS/Linux: `curl -fsSL https://deno.land/install.sh | sh`
-  - Windows (npm): `npm install -g deno`
-- (Optional) [Bun](https://bun.sh/) — only needed for the TUI log viewer
+- **Python ≥ 3.10**
+- A **JS runtime for the sandbox**: Deno (recommended) *or* Node ≥ 18, plus the
+  `pyodide` npm package.
+- API credentials for whatever model provider you use (or a local server).
 
-### Environment Variables
-
-Set your LLM API key before running:
+### 1. Install the Python package
 
 ```bash
-export RLM_MODEL_API_KEY=sk-or-...
+cd rlm_engine
+pip install -e ".[litellm]"      # LiteLLM client: OpenRouter + local + hosted
+# or pick a specific provider extra:
+#   pip install -e ".[anthropic]"
+#   pip install -e ".[openai]"
 ```
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RLM_MODEL_API_KEY` | API key for the OpenAI-compatible backend (falls back to `OPENAI_API_KEY`, then `OPENROUTER_API_KEY`) | — |
-| `RLM_MODEL_BASE_URL` | OpenAI-compatible base URL | `https://openrouter.ai/api/v1` |
+### 2. Install a sandbox runtime
 
-That's all you need to get started. By default, fast-rlm uses [OpenRouter](https://openrouter.ai); you can point it at any OpenAI-compatible API by setting `RLM_MODEL_BASE_URL`. fast-rlm also runs on Vertex AI, the native Anthropic API, and local ACP coding agents — see **Backend setup** at the end of this README.
-
-
-## Quick Start
-
-![Quickstart](docs/images/quickstart.jpeg)
-
-```python
-import fast_rlm
-from fast_rlm import RLMConfig
-
-# primary_agent is REQUIRED — there is no default model.
-config = RLMConfig(primary_agent="z-ai/glm-5")
-
-result = fast_rlm.run("Generate 50 fruits and count number of r", config=config)
-print(result["results"])
-print(result["usage"])
-```
-
-> **`primary_agent` is required.** Every `run()` needs a config that sets it (e.g. `RLMConfig(primary_agent="...")`); `sub_agent` is optional and defaults to `primary_agent`. The shorter examples below omit `config=` for brevity — pass the `config` above to run them.
-
-### From the command line
-
-The same engine is available as a `fast-rlm` CLI — handy for one-off runs and shell pipelines:
+Recommended — Deno (hardened: WASM boundary + denied OS permissions):
 
 ```bash
-# A plain prompt
-fast-rlm "Generate 50 fruits and count number of r" --primary-agent z-ai/glm-5
-
-# Feed a file as the context. Parsed by extension:
-#   .json/.yaml/.yml -> dict/list   .jsonl/.ndjson -> list[dict]
-#   anything else (.csv, .tsv, .xml, .toml, .txt, ...) -> raw text the model parses
-#       itself (its extension is noted so it knows the format).
-# The prompt becomes the instruction; for a dict input with no "instruction" key,
-# it's also injected into the dict.
-fast-rlm "Aggregate the reviews into a verdict" --input-file reviews.json --primary-agent z-ai/glm-5
-
-# -q prints only the result (clean for piping); other knobs mirror RLMConfig:
-fast-rlm "..." --primary-agent acp:opencode --max-depth 2 --max-global-calls 50 -q
+curl -fsSL https://deno.land/install.sh | sh    # or: npm i -g deno
+deno cache npm:pyodide                           # pre-fetch so runs need no network
 ```
 
-Run `fast-rlm --help` for all flags (`--sub-agent`, `--max-calls`, `--acp-agents`, `--vertex`, …).
+Dev fallback — Node (works, but weaker isolation; see `docs/sandbox.md`):
 
-The same file loading is available from Python — `run()` accepts an `input_file` (in place of `query`):
-
-```python
-fast_rlm.run(input_file="reviews.json", instruction="Aggregate into a verdict", config=config)
+```bash
+cd rlm_engine
+npm install pyodide
 ```
 
-## Model backends
+### 3. Provide credentials
 
-The `primary_agent` / `sub_agent` string selects one of four backends:
-
-| Mode | Example `primary_agent` | What it is |
-|---|---|---|
-| **Any OpenAI-compatible API** (default) | `"gpt-5-mini"`, `"deepseek-chat"`, `"minimax/minimax-m3"` | OpenAI, DeepSeek, OpenRouter (default), or any compatible endpoint |
-| **Vertex AI** | `"vertex/claude-sonnet-4-6"` | Google Cloud (ADC auth) |
-| **Anthropic API** | `"claude-haiku-4-5"`, `"anthropic/claude-sonnet-4-6"` | Native Anthropic; falls back to the OpenAI-compatible endpoint if no key |
-| **ACP coding agent** | `"acp:codex"`, `"acp:claude-code"`, `"acp:opencode"` | Drives a local coding agent, read-only |
-
-Set the credential only for the backend(s) you use — see **Backend setup** at the end of this README. An ACP-only run needs no API key at all.
-
-## Arbitrarily Long Context
-
-The key idea behind RLMs is that the prompt can be arbitrarily long — far beyond any model's context window. The agent explores it programmatically through the REPL rather than trying to fit it all into a single call.
-
-```python
-import fast_rlm
-
-transcripts = open("lex_fridman_all_transcripts.txt").read()  # millions of tokens
-
-result = fast_rlm.run(
-    "Here are the transcripts of all Lex Fridman podcasts. "
-    "Summarize what the first 5 Machine Learning guests had to say about AGI.\n\n"
-    + transcripts
-)
-print(result["results"])
+```bash
+export OPENROUTER_API_KEY=...      # for OpenRouter via LiteLLM
+# or ANTHROPIC_API_KEY / OPENAI_API_KEY for the native clients
+# local servers (vLLM/llama.cpp/Ollama/LM Studio) need no real key
 ```
 
-The agent will write code to search, filter, and chunk the transcripts on its own — no manual splitting required.
+---
 
-## Structured Input & Output
+## Usage
 
-Instead of squeezing your data into a string, you can pass a `dict` as the query and ask for a typed result back via `output_schema`. The agent receives the dict as a real Python `dict` (no parsing on its first turn), and its `FINAL` value is validated against the schema before being returned.
+### Quickstart (OpenRouter)
 
 ```python
-import fast_rlm
-from pydantic import BaseModel
+from rlm import RLM, LiteLLMClient, PyodideSandbox
 
-class Verdict(BaseModel):
-    movie: str
-    average_score: float
-    consensus: str
-
-result = fast_rlm.run(
-    {
-        "task": "Aggregate the reviews into a single verdict.",
-        "movie": "The Trail of Pixels",
-        "reviews": [
-            {"name": "Asha", "score": 8, "text": "Tight pacing..."},
-            {"name": "Bo",   "score": 6, "text": "Beautiful but thin..."},
-            {"name": "Cy",   "score": 9, "text": "Instant favorite..."},
-        ],
-    },
-    output_schema=Verdict,
+rlm = RLM(
+    client     = LiteLLMClient("openrouter/anthropic/claude-3.5-sonnet"),  # root
+    sub_client = LiteLLMClient("openrouter/anthropic/claude-3.5-haiku"),   # sub-calls
+    sandbox    = PyodideSandbox(runtime="auto"),   # Deno preferred, Node fallback
+    max_depth  = 1,
 )
 
-verdict = Verdict.model_validate(result["results"])
+out = rlm.complete(query="What is the magic number?", context=huge_string)
+print(out.answer)
+print(out.usage)        # token counts across root + every sub-call
 ```
 
-**Structured input.** When `query` is a `dict`, the agent's initial probe prints a flat top-level schema (keys + type + length + truncated preview) so it can index `context["reviews"]` directly instead of stringifying.
+If you omit `sandbox=...`, a `PyodideSandbox` is created and torn down per call.
 
-**Structured output.** `output_schema` accepts:
+### Local models
 
-| Form | Example |
+vLLM, llama.cpp, Ollama, and LM Studio all expose OpenAI-compatible endpoints, so
+one `LiteLLMClient` config drives any of them. Because RLMs fan out **parallel**
+sub-calls, serving throughput matters more than single-stream latency — see
+`docs/local-models.md` for the vLLM-vs-GGUF tradeoff and concurrency tuning.
+
+```python
+client = LiteLLMClient("openai/Qwen2.5-14B-Instruct",
+                       api_base="http://localhost:8000/v1", api_key="sk-noop")
+rlm = RLM(client=client, sub_client=client,
+          sub_max_parallel=8,            # match your server's concurrent slots
+          sandbox=PyodideSandbox())
+```
+
+### What the model can do inside the sandbox
+
+| Call | Purpose |
 |---|---|
-| Pydantic model class | `output_schema=MyModel` |
-| Pydantic generic | `output_schema=list[MyModel]` |
-| Python primitive | `output_schema=int` (also `str`, `float`, `bool`, `list`, `dict`) |
-| Raw JSON Schema dict | `output_schema={"type": "array", "items": {"type": "string"}}` |
-
-The schema is shown to the agent at step 0 (`Required output schema for FINAL (JSON Schema):`). After every `FINAL(...)` call the value is validated; on failure the agent receives the schema and the specific validation errors (path + message) and may retry within its remaining call budget. Pydantic is an *optional* dependency — only required if you pass a Pydantic class or generic.
-
-**Schemas for subagents.** Inside the REPL the agent can require a subagent's output shape by passing a JSON Schema dict as the second argument to `llm_query`:
-
-```repl
-schema = {"type": "array", "items": {"type": "string"}}
-fruits = await llm_query("Generate 25 fruit names.", schema)
-```
-
-The child subagent enforces the schema the same way. See [`examples/structured_io.py`](examples/structured_io.py) and [`examples/parallel_r_count.py`](examples/parallel_r_count.py) for end-to-end demos.
-
-## Tools
-
-Inside the REPL the agent has two built-in tools and may also receive user-defined tools as ordinary Python functions. There is no separate tool-calling API — tools are just callables in the REPL namespace.
-
-Pass Python functions to `fast_rlm.run(..., tools=[my_fn])` and they will be pre-loaded into the root agent's REPL. The RLM is shown the function name, input names, and docstring as description. They are not shown the full internal code of the tool (although they can choose to inspect it if the task requires them to). The agent calls them like any normal function inside the REPL.
-
-```python
-def filter_short(items: list[str], max_len: int = 20) -> list[str]:
-    """Return only items shorter than max_len."""
-    return [x for x in items if len(x) < max_len]
-
-result = fast_rlm.run("Pick the short titles from the list." + str(list_of_titles), tools=[filter_short])
-```
-
-Two rules apply to any tool that may be handed to a sub-agent:
-
-- **Sub-agents do NOT inherit tools automatically.** To give a child a tool, the main agent must pass it explicitly in the REPL: `await llm_query("...", tools=[filter_short])`.
-- **Tools must be self-contained.** Do imports *inside* the function body and don't close over REPL-level variables - the child runs in a fresh REPL where outer state does not exist.
-
-The agent can also `def` new functions inside the REPL at any time and pass them down the same way.
-
-Currently all tools are expected to be Python functions. These functions are available inside the REPL. They are NOT available when the LLM produces code or generates reasoning steps.
-
-## Passing environment variables inside the REPL
-
-Tools often need credentials or configuration (API keys, base URLs, account IDs). Pass them through the `env_variables` kwarg on `fast_rlm.run(...)`:
-
-
-```python
-import os
-import fast_rlm
-
-def search_web(query: str, top_k: int = 5) -> list[dict]:
-    """Search the web via Tavily and return the top results."""
-    import os, urllib.request, json
-    req = urllib.request.Request(
-        "https://api.tavily.com/search",
-        data=json.dumps({"query": query, "max_results": top_k}).encode(),
-        headers={
-            "Authorization": f"Bearer {os.environ['TAVILY_API_KEY']}",
-            "Content-Type": "application/json",
-        },
-    )
-    return json.loads(urllib.request.urlopen(req).read())["results"]
-
-result = fast_rlm.run(
-    "Find three recent papers on recursive language models.",
-    tools=[search_web],
-    env_variables={"TAVILY_API_KEY": os.environ["TAVILY_API_KEY"]},
-)
-```
-
-Behavior:
-
-- `env_variables` must be a `dict[str, str]`.
-- Each entry is injected into `os.environ` inside **every** Pyodide REPL spawned by the run — the root agent and all sub-agents.
-- They are **not** set on the host Deno process and never appear in prompts, logs, or model context. The model only ever sees a tool's signature + docstring, so the key stays hidden as long as your tool doesn't print or return it.
-- Tools read them with the normal `os.environ["..."]` (do the `import os` inside the tool body — see the self-containment rule above).
-
-
-## Custom instructions
-
-Pass a directive through the `instruction` kwarg on `fast_rlm.run(...)`. When provided, it is appended to the **end** of the agent's system prompt:
-
-```
-Here is the user's instructions - you must follow it closely:
-{instruction}
-```
-
-```python
-result = fast_rlm.run(
-    "Summarize the attached incident report.",
-    instruction="Write all output in formal British English and never use bullet points.",
-)
-```
-
-**Instructions apply to one agent only — they are never inherited.** `run(instruction=...)` configures the **root agent** and nothing else. Sub-agents start with no instruction; to give a sub-agent one, the parent must pass it explicitly when it delegates:
-
-```python
-# inside an agent's REPL — instruct the child you spawn
-result = await llm_query(
-    chunk,
-    instruction="Extract only dollar amounts; return them as a JSON list.",
-)
-```
-
-This is a recursive, no-carry-on design: each agent sees only the instruction its spawner handed it. A child does not inherit its parent's instruction, and the child's own `llm_query(...)` calls start fresh unless it passes `instruction=` again. There is intentionally no global, run-wide instruction.
-
-Behavior:
-
-- `instruction` must be a `str`. When omitted (`None`), nothing is appended and the prompt is unchanged.
-- Because it is appended *after* the built-in prompt, a forceful instruction can override default behavior (e.g. output format or even the task itself). Keep it focused on *how* to answer rather than restating the task.
-- `run(instruction=...)` is a per-call argument, not part of `RLMConfig`; pass it directly to `run(...)`. The in-REPL form is `llm_query(..., instruction=...)`.
-
-
-## MCP servers
-
-fast-rlm can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers and expose their tools and resources inside the REPL. The agent calls them with `await mcp_call(server, tool, **kwargs)` and reads resources with `await mcp_read_resource(uri)` — just like any other REPL function.
-
-**Nothing extra to install for fast-rlm.** MCP support is optional and lazy: the MCP client lives in the Deno engine, and Deno auto-downloads it on first use. There is *no* `pip install fast-rlm[mcp]` — runs that don't use MCP never load it. You only install the **MCP servers** you actually want to connect to (each per its own docs).
-
-Pass servers to `run(..., mcp_servers={...})`, keyed by name. Transport is chosen by the config shape:
-
-```python
-import fast_rlm
-
-result = fast_rlm.run(
-    "Read /data/report.md and summarize it in three bullets.",
-    mcp_servers={
-        # stdio: fast-rlm SPAWNS the server (and kills it on exit) — you don't run it.
-        "fs":   {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"]},
-        # http: the server must already be running; you point at its URL.
-        "web":  {"url": "http://localhost:3333/mcp", "headers": {"Authorization": "Bearer ..."}},
-    },
-)
-```
-
-Install a server the usual way before pointing fast-rlm at it, e.g.:
-
-```bash
-# stdio servers are launched on demand via their command (npx/uvx/node/...)
-npx -y @modelcontextprotocol/server-filesystem /data    # Node-based
-uvx mcp-server-fetch                                     # Python-based
-```
-
-| Config key | Transport | Who runs the server? | Notes |
-|---|---|---|---|
-| `command` (+ `args`, `cwd`, `env`) | stdio | fast-rlm spawns it | grants Deno `--allow-run`; **a shell/filesystem server is full host access, not sandboxed** |
-| `url` (+ `headers`) | HTTP | you (must be listening) | |
-
-Inside the REPL the agent gets a small, lazy discovery API (the step-0 probe only shows counts, never full schemas):
-
-- `mcp_list_tools(server=None)` / `mcp_tool_schema("server.tool")` / `await mcp_call(server, tool, **kwargs)`
-- `mcp_list_resources()` / `mcp_list_resource_templates()` / `await mcp_read_resource(uri, server=None)`
-
-
-## Configuration
-
-```python
-from fast_rlm import run, RLMConfig
-
-config = RLMConfig.default()
-config.primary_agent = "minimax/minimax-m2.5"
-config.sub_agent = "minimax/minimax-m2.5"
-config.max_depth = 5
-config.max_money_spent = 2.0
-
-result = run(
-    "Count the r's in 50 fruit names",
-    prefix="r_count",
-    config=config,
-)
-```
-
-All config fields:
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `primary_agent` | `str` | **(required)** | Model for the root agent. No default — must be set or `run()` raises. |
-| `sub_agent` | `str` | `primary_agent` | Model for child subagents. Defaults to `primary_agent` when unset. |
-| `max_depth` | `int` | `3` | Max recursive subagent depth |
-| `max_calls_per_subagent` | `int` | `20` | Max LLM calls per subagent |
-| `truncate_len` | `int` | `2000` | Output chars shown to the LLM per step |
-| `max_money_spent` | `float` | `1.0` | Hard budget cap in USD |
-| `max_completion_tokens` | `int` | `50000` | Max total completion tokens across all subagents |
-| `max_prompt_tokens` | `int` | `200000` | Max total prompt tokens across all subagents |
-| `max_global_calls` | `int` | `∞` (50 for ACP) | Max total LLM calls across the whole run (root + all subagents) |
-
-## Best Practices & Troubleshooting
-
-- **Place your task at the top or bottom of the prompt** — the REPL restricts how much context the LLM sees, so don't bury the task in the middle.
-- **Mark structured data with backtick blocks** — wrap JSON, CSV, etc. in fenced code blocks and name the format in the prompt.
-- **Use strong coding models** — agents write and execute Python, so coding benchmarks matter. See [recommended models](https://avbiswas.github.io/fast-rlm/guide/configuration/#model-names).
-- **Inject domain docs when needed** — for obscure domains, add reference material and tell the agent how it's organized (e.g. with `##` headers).
-- **Check logs and start with strict limits** — review what the agent is doing before scaling up. Prompt changes usually help more than bigger budgets.
-
-For the full guide, see the [Best Practices & Troubleshooting](https://avbiswas.github.io/fast-rlm/guide/tips/) docs page.
-
-
-
-### Vertex AI (Google Gemini) — optional
-
-> Skip this section unless you specifically want to run Gemini models on Google Cloud. It is **not** required for the default OpenRouter (or any OpenAI-compatible) setup above.
-
-Use Gemini models via Vertex AI with IAM-based auth (no API key needed):
-
-```python
-import fast_rlm
-
-config = fast_rlm.RLMConfig()
-config.primary_agent = "vertex/google/gemini-2.5-flash"
-config.sub_agent = "vertex/google/gemini-2.5-flash"
-
-result = fast_rlm.run("Count the r's in 50 fruits", config=config, vertex=True)
-```
-
-This path uses these extra environment variables instead of `RLM_MODEL_API_KEY`:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `GOOGLE_CLOUD_PROJECT` | GCP project ID | — |
-| `GOOGLE_CLOUD_LOCATION` | GCP region | `us-central1` |
-
-Auth uses Application Default Credentials. Either run `gcloud auth application-default login` or set `GOOGLE_APPLICATION_CREDENTIALS` to a service account key path.
-
----
-
-## Log Viewer
-
-![TUI Log Viewer](docs/images/tui.jpeg)
-
-Every run saves a `.jsonl` log file to `logs/`.
-
-```bash
-# Print stats (no extra dependencies)
-fast-rlm-log logs/run_xxx.jsonl
-
-# Interactive TUI viewer (requires bun)
-fast-rlm-log logs/run_xxx.jsonl --tui
-```
-
----
-
-## Development (from source)
-
-### 1. Install Deno
-
-Windows (npm):
-
-```powershell
-npm install -g deno
-```
-
-macOS / Linux:
-
-```bash
-curl -fsSL https://deno.land/install.sh | sh
-```
-
-Then add Deno to your `PATH`:
-
-```bash
-export DENO_INSTALL="$HOME/.deno"
-export PATH="$DENO_INSTALL/bin:$PATH"
-```
-
-### 2. Install Bun (for the log viewer)
-
-```bash
-curl -fsSL https://bun.sh/install | bash
-cd tui_log_viewer && bun install
-```
-
-### 3. API Key Setup
-
-Set your key in `.env` or `.envrc`:
-
-```bash
-export RLM_MODEL_API_KEY=sk-or-...
-```
-
-### 4. Configuration
-
-Edit `rlm_config.yaml` at the project root:
-
-```yaml
-max_calls_per_subagent: 20
-max_depth: 3
-truncate_len: 2000
-primary_agent: "z-ai/glm-5"   # REQUIRED — no default
-# sub_agent is optional; omit it to reuse primary_agent for subagents
-sub_agent: "minimax/minimax-m2.5"
-max_money_spent: 1.0
-max_completion_tokens: 50000
-max_prompt_tokens: 200000
-```
-
-### 5. Running
-
-```bash
-# Run the example
-deno task test_counting_r
-
-# Run the subagent directly
-echo "What is 2+2?" | deno task subagent
-
-# View logs
-./viewlog logs/<logfile>.jsonl
-```
-
-### 6. Benchmarks
-
-```bash
-uv sync --extra benchmarks
-uv run benchmarks/oolong_synth_benchmark.py
-uv run benchmarks/longbench_benchmark.py
-```
-
----
-
-## Backend setup
-
-fast-rlm picks a backend from the `primary_agent`/`sub_agent` string (see [Model backends](#model-backends)). **Set the credential only for the backend(s) you use** — each is validated at point of use, so an ACP-only run needs no API key at all.
-
-### 1. OpenAI-compatible API (default)
-
-Any OpenAI-compatible endpoint — OpenAI, DeepSeek, OpenRouter (default), or anything else.
-
-```bash
-export RLM_MODEL_API_KEY=sk-...                       # or OPENAI_API_KEY, or OPENROUTER_API_KEY
-export RLM_MODEL_BASE_URL=https://api.deepseek.com    # optional; defaults to OpenRouter
-```
-```yaml
-primary_agent: "deepseek-chat"     # or "gpt-5-mini", "minimax/minimax-m3", ...
-```
-
-### 2. Vertex AI
-
-Google Cloud, via Application Default Credentials (no static key). Prefix the model with `vertex/`, or set `RLM_VERTEX_AI=1` (Python: `run(..., vertex=True)`) to route every model through Vertex.
-
-```bash
-gcloud auth application-default login
-export GOOGLE_CLOUD_PROJECT=your-project
-```
-```yaml
-primary_agent: "vertex/claude-sonnet-4-6"
-```
-
-### 3. Anthropic API (native)
-
-Claude models (`claude-*` or `anthropic/claude-*`) use the native Anthropic API when `ANTHROPIC_API_KEY` is set. If the native call is unavailable, fast-rlm transparently falls back to the OpenAI-compatible endpoint — so `anthropic/...` strings keep working through OpenRouter even without an Anthropic key.
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-export ANTHROPIC_BASE_URL=https://my-proxy.example.com   # optional; defaults to https://api.anthropic.com
-```
-```yaml
-primary_agent: "claude-haiku-4-5"        # or "anthropic/claude-sonnet-4-6"
-```
-Token usage is reported (so budgets apply); cost shows `Unknown` (the SDK returns no cost).
-
-### 4. ACP coding agent
-
-Drives a local coding agent (Claude Code, Codex, opencode) read-only — no API key needed (the agent uses its own CLI login). Because token/cost budgets don't apply to ACP, `max_global_calls` defaults to `50` for ACP runs. See the **ACP agents** section below for presets and the backdoor.
-
-```yaml
-primary_agent: "acp:opencode"      # or "acp:claude-code", "acp:codex"
-```
-
-### Credential resolution
-
-| Backend | Selector | Credential |
+| `print(context[:2000])` | peek at slices (stdout is truncated by the scaffold) |
+| `await llm_query(task, data=None, schema=None)` | one focused sub-call; task and data kept separate |
+| `await batch_llm_query(jobs)` | run many leaf sub-calls **in parallel**, results in order |
+| `await rlm_query(task, data=…)` | spawn a **recursive child RLM** over `data` (only when `max_depth>1`; else a leaf) |
+| `await batch_rlm_query(jobs)` | run many recursive children in parallel |
+| `FINAL(value)` | end the run, return any value (str/dict/list/number) |
+| `FINAL_VAR("name")` | end the run, return the REPL variable named `name` |
+
+### Backend
+
+**`PyodideSandbox(runtime="deno"|"node"|"auto")`** is the only execution backend —
+the hardened WASM sandbox (Deno preferred). There is deliberately **no in-process
+`exec` backend**: running untrusted model-generated code in your own process is
+unacceptable for an RLM, so it isn't offered. Pair it with `SandboxPool` to skip
+the cold start across calls.
+
+### Key parameters (`RLM(...)`)
+
+| Param | Default | Meaning |
 |---|---|---|
-| OpenAI-compatible | unprefixed (e.g. `gpt-5-mini`) | `RLM_MODEL_API_KEY` → `OPENAI_API_KEY` → `OPENROUTER_API_KEY` (+ optional `RLM_MODEL_BASE_URL`) |
-| Vertex AI | `vertex/…` or `RLM_VERTEX_AI=1` | ADC + `GOOGLE_CLOUD_PROJECT` |
-| Anthropic | `claude-…` / `anthropic/…` | `ANTHROPIC_API_KEY` (or `RLM_ANTHROPIC_API_KEY`) (+ optional `ANTHROPIC_BASE_URL`) |
-| ACP | `acp:…` | none (agent's own CLI login) |
+| `client` | — | root model (writes the code) |
+| `sub_client` | = `client` | model used for `llm_query`/`batch_llm_query` |
+| `sandbox` | `PyodideSandbox()` | execution backend |
+| `max_iterations` | `12` | max root REPL turns before a forced final |
+| `max_depth` | `1` | recursion depth; `>1` spawns a fresh isolated sandbox per sub-call (slower) |
+| `sub_max_parallel` | `8` | parallel workers for `batch_llm_query` |
+| `verbose` | `False` | print each root turn |
+
+`RLM(...)` also takes `on_span` (a callback fired per span, for live tracing/TUI),
+`trace_content` (default `False`; set `True` to capture prompt/response text), and
+`redact` (a scrubber applied to captured text). The run's full span tree is on
+`RLMResult.trace`.
+
+`PyodideSandbox(...)` adds: `exec_timeout` (default `120` s of sandbox compute
+per cell; a runaway cell is killed and the sandbox auto-restarts),
+`startup_timeout` (default `120` s), and `allow_unsafe_node` (default `False` —
+required to use the non-isolating Node runtime).
+
+### Run the examples
+
+```bash
+cd rlm_engine
+python examples/niah_demo.py          # needs a provider key + sandbox runtime
+python examples/local_vllm_demo.py    # set RLM_API_BASE / RLM_MODEL first
+```
+
+### Run the tests
+
+```bash
+cd rlm_engine
+python tests/test_rlm.py        # offline: mock model, no API key, no runtime
+python tests/test_sandbox.py    # real Pyodide WASM (needs deno/node + pyodide)
+```
+
+`test_sandbox.py` proves isolation (host filesystem invisible, `import js`
+blocked), the async `llm_query` bridge, parallel `batch_llm_query`, `FINAL`
+round-trips, and a full RLM run driving the real WASM sandbox to the answer.
 
 ---
 
-## ACP agents (Claude Code, Codex, opencode, …)
+## How it works (brief)
 
-Besides OpenAI-compatible and Vertex models, fast-rlm can use a coding agent that
-speaks the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) as the
-"brain". The agent is prompted with fast-rlm's system prompt + history and replies
-with a ```` ```repl ```` block, which fast-rlm executes in its own Pyodide sandbox —
-exactly like any other model. **The agent itself runs read-only and never writes
-files or runs the code; fast-rlm does.**
+1. The context is loaded as a `context` variable inside the sandbox; the root
+   prompt gets the query plus *metadata* (type, size) only.
+2. The root model writes ` ```repl ` code blocks. The engine executes each block
+   in a persistent notebook namespace and feeds back the (truncated) stdout.
+3. Code can call `llm_query`/`batch_llm_query`; those marshal out to the host,
+   which runs the sub-model(s) — in parallel for batches — and returns results.
+4. The model calls `FINAL(...)` to end the run. Token/usage is aggregated across
+   the root and all sub-calls.
 
-Select one with an `acp:` prefix on `primary_agent`/`sub_agent` (mirrors the
-`vertex/` convention):
-
-```yaml
-primary_agent: "acp:claude-code"
-sub_agent:     "acp:codex?model=gpt-5.5-codex"   # ?model= is optional
-```
-
-```python
-run(query, config=RLMConfig(primary_agent="acp:opencode"))
-```
-
-**Built-in presets** (verified): `acp:claude-code`, `acp:codex`, `acp:opencode`.
-Claude Code and Codex are launched via their `npx` adapters, so **Node/npx must be
-on PATH** and the agent itself must already be logged in (e.g. `claude /login`,
-`codex login`, `opencode auth login`).
-
-**Backdoor — any other ACP agent.** Register it by command under `acp_agents`, then
-select it by name. Built-in presets need no entry; a registered name overrides a
-preset of the same name.
-
-```python
-run(query, config=RLMConfig(
-    primary_agent="acp:hermes",
-    acp_agents={
-        "hermes": {"command": "hermes", "args": ["acp"]},
-        "cursor": {"command": "npx", "args": ["-y", "cursor-agent-acp"]},
-    },
-))
-```
-
-Each entry accepts `command`, `args?`, `readonly_mode?` (the agent's read-only mode
-id, if it has one), `model?`, `auth_method?` (ACP auth method id — pinning it
-silences the provider's "authMethodId is not configured" warning), `env?`, and
-`config_files?` (relative path → JSON content written into the temp cwd before
-launch — use this to inject permission configs for custom agents).
-
-**Tool stripping (built-in presets only):**
-
-fast-rlm's goal is that all computation happens in the Pyodide REPL — not inside
-the agent's own tool harness. Without restrictions, agents like Claude Code will use
-their native bash/file-read tools to pre-compute answers internally and return
-hardcoded results, bypassing the observable REPL loop. The three built-in presets
-block this by injecting agent-specific permission configs into the throwaway cwd
-before each launch:
-
-| Agent | Mechanism |
-| ----- | --------- |
-| `acp:claude-code` | `.claude/settings.json` written to temp cwd — denies `Bash(*)`, `Read(*)`, `Write(*)`, `Edit(*)`, `WebFetch(*)`, `WebSearch(*)` |
-| `acp:opencode`    | `opencode.json` written to temp cwd — sets `bash`, `read`, `edit`, `glob`, `grep` to `"deny"` |
-| `acp:codex`       | `-c sandbox_permissions=[]` flag in launch args — empty permissions array |
-
-> **Backdoor agents do not get this automatically.** Agents registered via
-> `acp_agents` are launched as-is. To restrict a custom agent, add a `config_files`
-> entry to its spec (see the [ACP agents guide](docs/guide/acp-agents.md)) or set
-> its `readonly_mode` field.
-
-**Safety & caveats:**
-
-- Every ACP agent runs in a throwaway temp `cwd`, so a stray write is contained.
-- When the agent has a read-only session mode (`readonly_mode`), fast-rlm switches
-  into it. The presets do this automatically: opencode/claude-code use `plan` (a
-  hard block); codex uses `read-only` (approval-gated — it may still write if it
-  asks, so the temp `cwd` is its real guardrail).
-- Agents with **no session modes** (e.g. cursor, hermes) are contained by the temp
-  `cwd` alone.
-- **Budgets:** ACP agents report no token usage, so `max_money_spent`,
-  `max_completion_tokens`, and `max_prompt_tokens` are **inert** for them (always
-  zero, never trip). The only budget that works is **`max_global_calls`**, which
-  **defaults to `50`** for ACP runs (override it on the config/CLI as needed).
+Scaffold truncation (head 4000 + tail 1000 chars by default) bounds what any
+REPL output can inject back into the root context, so file size never inflates
+the root prompt.
 
 ---
 
-## Contributing
+## Recently fixed
 
-- **Small PRs only** — keep changes focused and minimal. Large PRs will not be accepted.
-- **No LLM-generated slop** — AI-assisted code is fine, but bulk-generated boilerplate with no thought behind it will be rejected.
-- **Minor features welcome** — small, well-scoped PRs that add useful functionality will be considered.
-- **Large feature requests** — open an issue first to discuss the design before writing any code.
+- **Execution timeout.** A per-cell `exec_timeout` (default 120 s of sandbox
+  compute, excluding sub-call time) kills a runaway interpreter and auto-restarts
+  it; the cell returns an `ExecutionTimeout` message.
+- **Recursion (`max_depth ≥ 2`).** Each recursive sub-call now runs in its **own
+  fresh sandbox** (isolated context, globals, and stdio pipe — safe under parallel
+  batches). It costs one sandbox spawn per sub-call, so it's slower; depth 1
+  remains the default.
+- **State leak / `reset()`.** Re-`set_context` now clears the REPL namespace, and
+  `sandbox.reset()` clears it explicitly — reusing a sandbox no longer bleeds
+  variables across queries.
+- **Schema validation.** `llm_query(schema=...)` now validates with `jsonschema`
+  (install the `schema` extra) and does one repair re-ask on failure. Without
+  `jsonschema` installed it falls back to parse-only.
+- **Provider retry.** Anthropic/OpenAI/LiteLLM calls use bounded retry with
+  jittered backoff and a per-call timeout.
+- **Dollar-cost accounting.** `Usage.cost_usd` is computed per call (via LiteLLM's
+  price map when installed, else an editable `rlm.clients._PRICES` table) and
+  aggregated across the root and all sub-calls; unknown models report `0` with a
+  one-time warning.
+- **Context streaming.** Contexts above ~256 KB are chunked over stdio
+  (`init_begin`/`ctx_chunk`/`init_end`) instead of one giant JSON line, raising the
+  practical ceiling to tens of MB. Note: Pyodide still holds the full string in
+  WASM memory — this is chunked transfer, not zero-copy; true file-backed access
+  would break Deno's read-scope and is out of scope.
+- **Host tools channel.** Pass `RLM(tools={"name": callable, ...})`; model code
+  calls `await tool("name", ...)` in the sandbox, the host runs the allowlisted
+  callable (in the trusted host process) and returns a JSON result. Tool names and
+  docstrings are advertised in the system prompt; unknown names error cleanly.
+  Isolation is unchanged (only allowlisted callables run); MCP can be layered on as
+  a tool that proxies to a server.
+- **Isolation hardening.** Deno read is scoped to the cache dir, env is denied,
+  and provider keys are scrubbed from the subprocess env; Node requires
+  `allow_unsafe_node=True`. (See `rlm_engine/FIXES.md` for the probe evidence.)
+- **Arbitrary context objects.** `context` can be any Python object.
+  `PyodideSandbox(context_codec="auto"|"json"|"pickle")` pickles non-JSON objects
+  across the boundary (default `auto`). The object's classes must be importable
+  inside the sandbox, else a clear error; don't
+  use the pickle codec for context whose bytes are untrusted (use `json`).
+- **Warm-sandbox pooling.** `SandboxPool(size=N)` keeps warm subprocesses;
+  `RLM(sandbox_pool=pool)` leases one per call to skip the ~5 s cold start. Dead
+  subprocesses are detected and replaced; each sandbox is cleared between leases.
+- **Observability / tracing.** Every model interaction (root turns, REPL cells,
+  sub-calls, tool calls, schema repairs, recursive children) is recorded as a
+  nested `Span` with timing/tokens/cost/depth/parent. Read `RLMResult.trace`, or
+  stream live via `RLM(on_span=…)`; `Span.to_otel()` gives an OpenTelemetry-GenAI
+  shape. Prompt/response text is **opt-in** (`trace_content=True`) with a `redact=`
+  hook — off by default since context may hold secrets. Replaces the old flat
+  `trajectory`. See `rlm_engine/docs/observability.md`.
+
+## Known limitations
+
+- **Sub-call `data` cap.** Non-string `data` passed to `llm_query` is capped at
+  500,000 chars when serialized; string `data` is passed whole.
+- **Context-class availability (pickle codec).** An arbitrary object sent to the
+  Pyodide sandbox needs its classes importable there; a host-only `__main__` class
+  can't be reconstructed — load the class source into the sandbox, or pass a
+  JSON-serializable context.
+
+---
+
+## References
+
+- Zhang, Kraska, Khattab. *Recursive Language Models.* arXiv:2512.24601 —
+  https://arxiv.org/abs/2512.24601 · blog: https://alexzhang13.github.io/blog/2025/rlm/
+- Official code: https://github.com/alexzhang13/rlm · minimal: `rlm-minimal`
+- In-repo: `Recursive_Language_Models_Research_Synthesis.md`,
+  `rlm_engine/RLM_LITERATURE_REVIEW.md`, `rlm_engine/FIXES.md`.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT.

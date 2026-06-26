@@ -1,62 +1,27 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [project]
-name = "fast-rlm"
-version = "0.2.4"
-description = "Light-dependency, Feature-Rich Implementation of Recursive Language Models"
+name = "rlm-engine"
+version = "0.2.0"
+description = "A working Recursive Language Model (RLM) engine with strict query/context separation, parallel sub-calls, and depth control."
 readme = "README.md"
-license = "MIT"
 requires-python = ">=3.10"
-dependencies = [
-    "pyyaml>=6.0",
-]
-
-[project.urls]
-Documentation = "https://avbiswas.github.io/fast-rlm/"
-Repository = "https://github.com/avbiswas/fast-rlm"
-"Original Paper" = "https://arxiv.org/abs/2512.24601"
+license = { text = "MIT" }
+dependencies = []
 
 [project.optional-dependencies]
-benchmarks = [
-    "datasets==3.6.0",
-]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.50"]
+litellm = ["litellm>=1.50"]
+schema = ["jsonschema>=4"]          # enables real llm_query(schema=...) validation
+tui = ["textual>=0.60"]             # trace viewer (run_tui / live_tui)
+dev = ["pytest>=8", "jsonschema>=4", "litellm>=1.50", "textual>=0.60", "coverage>=7"]
 
 [project.scripts]
-fast-rlm = "fast_rlm._cli:main"
-fast-rlm-log = "fast_rlm._cli:view_log"
+rlm = "rlm.cli:main"
+rlm-tui = "rlm.cli:tui_main"
 
-[tool.hatch.build.targets.sdist]
-exclude = [
-    ".venv",
-    ".jj",
-    ".claude",
-    "node_modules",
-    "tui_log_viewer/node_modules",
-    "logs",
-    "sample_logs",
-    "dist",
-    "__pycache__",
-    "*.egg-info",
-    "images",
-    "benchmarks",
-    "uv.lock",
-    "docs",
-    "mkdocs.yml",
-    "examples/*",
-    "scripts/*",
-]
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
 
-[tool.hatch.build.targets.wheel]
-packages = ["fast_rlm"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src" = "fast_rlm/_engine/src"
-"deno.json" = "fast_rlm/_engine/deno.json"
-"deno.lock" = "fast_rlm/_engine/deno.lock"
-"rlm_config.yaml" = "fast_rlm/_engine/rlm_config.yaml"
-"tui_log_viewer/src" = "fast_rlm/_engine/tui_log_viewer/src"
-"tui_log_viewer/package.json" = "fast_rlm/_engine/tui_log_viewer/package.json"
-"tui_log_viewer/tsconfig.json" = "fast_rlm/_engine/tui_log_viewer/tsconfig.json"
-"tui_log_viewer/bun.lock" = "fast_rlm/_engine/tui_log_viewer/bun.lock"
+[tool.setuptools]
+packages = ["rlm"]
